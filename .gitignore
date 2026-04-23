@@ -1,0 +1,18 @@
+# Runtime artifacts written by the configure_tools_* scripts
+configured_tools.sh
+configured_tools.bat
+*.backup
+
+# Cert bundles produced by the scripts (in case anyone runs them from the repo dir)
+netskope-cert-bundle.pem
+*.pem
+
+# Python
+__pycache__/
+*.pyc
+
+# Claude Code local settings (personal, per-machine)
+.claude/settings.local.json
+
+# macOS
+.DS_Store
