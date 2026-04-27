@@ -2,6 +2,8 @@
 
 Cross-platform scripts that detect popular CLI tools, libraries, and desktop apps and point them at a Netskope SSL-inspection certificate bundle.
 
+> **Disclaimer:** These scripts are based on publicly available Netskope and individual CLI/tool vendor documentation. They are **not** an official Netskope product and are **not supported by Netskope**. Use at your own risk.
+
 Each script:
 
 1. Builds a CA bundle at `<certDir>/<certName>` containing the Netskope tenant CA + the Mozilla root bundle (from `curl.se`).
