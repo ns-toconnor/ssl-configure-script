@@ -323,6 +323,8 @@ configure_tool "Oracle Cloud CLI" "OCI_CLI_CA_BUNDLE" "oci" ""
 configure_tool "Cargo Package Manager" "CARGO_HTTP_CAINFO" "cargo" ""
 configure_tool "Yarn" "" "yarnpkg" "yarnpkg config set httpsCaFilePath \"$certDir/$certName\""
 configure_tool "Claude CLI" "NODE_EXTRA_CA_CERTS" "claude" ""
+# Netskope CLI (httpx-based) honors NETSKOPE_CA_BUNDLE; also reads REQUESTS_CA_BUNDLE / SSL_CERT_FILE / CURL_CA_BUNDLE
+configure_tool "Netskope CLI" "NETSKOPE_CA_BUNDLE" "ntsk" ""
 
 # Check if Azure Storage Explorer exists
 echo

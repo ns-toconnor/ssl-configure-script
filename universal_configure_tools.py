@@ -296,6 +296,8 @@ configure_tool("Cargo Package Manager", "CARGO_HTTP_CAINFO", "cargo")
 configure_tool("Yarn", None, "yarnpkg",
                f'yarnpkg config set httpsCaFilePath "{bundle_arg}"')
 configure_tool("Claude CLI", "NODE_EXTRA_CA_CERTS", "claude")
+# Netskope CLI (httpx-based) honors NETSKOPE_CA_BUNDLE; also reads REQUESTS_CA_BUNDLE / SSL_CERT_FILE / CURL_CA_BUNDLE
+configure_tool("Netskope CLI", "NETSKOPE_CA_BUNDLE", "ntsk")
 
 # --- Azure Storage Explorer ---
 print()

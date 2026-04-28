@@ -2,6 +2,8 @@
 
 Cross-platform scripts that detect popular CLI tools, libraries, and desktop apps and point them at a Netskope SSL-inspection certificate bundle.
 
+> **Origin:** Based on [duduke/ssl-configure-scripts](https://github.com/duduke/ssl-configure-scripts). This fork adds coverage for additional dev tools and switches certificate retrieval to work with **Netskope Secure Enrollment** (tenant API + local STAgent certs) instead of the legacy org-key flow.
+
 > **Disclaimer:** These scripts are based on publicly available Netskope and individual CLI/tool vendor documentation. They are **not** an official Netskope product and are **not supported by Netskope**. Use at your own risk.
 
 Each script:
@@ -85,6 +87,7 @@ Where a tool honors an environment variable, the script exports it in the user's
 | npm | `npm config set cafile` |
 | Yarn | `yarn config set httpsCaFilePath` |
 | Claude CLI | `NODE_EXTRA_CA_CERTS` env var |
+| Netskope CLI (`ntsk` / `netskope`) | `NETSKOPE_CA_BUNDLE` env var |
 | Ruby | `SSL_CERT_FILE` env var |
 | PHP Composer | `composer config --global cafile` |
 | Oracle Cloud CLI | `OCI_CLI_CA_BUNDLE` env var |

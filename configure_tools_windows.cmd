@@ -370,6 +370,17 @@ if %ERRORLEVEL% EQU 0 (
     echo Claude CLI is not installed
 )
 
+:: Netskope CLI (httpx-based; honors NETSKOPE_CA_BUNDLE per src/netskope_cli/core/config.py)
+echo.
+where ntsk >NUL 2>&1
+if %ERRORLEVEL% EQU 0 (
+    echo Netskope CLI is installed
+    ntsk --version 2>&1
+    call :setx_if_needed "Netskope CLI" "NETSKOPE_CA_BUNDLE" "%certDir%\%certName%"
+) else (
+    echo Netskope CLI is not installed
+)
+
 :: ============================================================
 :: Application-specific configurations (file/config based)
 :: ============================================================
