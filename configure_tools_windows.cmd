@@ -53,10 +53,10 @@ if exist "%NS_CA_CERT%" if exist "%NS_TENANT_CERT%" (
     echo.
     echo Netskope client is installed. Found local certificates:
     echo.
-    echo CA Certificate (nscacert.pem):
+    echo CA Certificate ^(nscacert.pem^):
     openssl x509 -in "%NS_CA_CERT%" -noout -subject 2>NUL
     echo.
-    echo Tenant Certificate (nstenantcert.pem):
+    echo Tenant Certificate ^(nstenantcert.pem^):
     openssl x509 -in "%NS_TENANT_CERT%" -noout -subject 2>NUL
     echo.
     set /p "use_local=Use these local certificates instead of the API? (Y/n): "
@@ -75,7 +75,7 @@ if "%use_local_certs%"=="0" (
 
     if "!api_token!"=="" (
         echo.
-        :: Read the token via PowerShell so it isn't echoed to the console
+        rem Read the token via PowerShell so it isn't echoed to the console
         for /f "usebackq tokens=* delims=" %%T in (`powershell -NoProfile -Command "$s = Read-Host -Prompt 'Please provide the Netskope API Bearer token' -AsSecureString; $b = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($s); [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($b)"`) do set "api_token=%%T"
         if "!api_token!"=="" (
             echo Error: API token cannot be empty
@@ -118,7 +118,7 @@ if "%use_local_certs%"=="1" (
         exit /b 1
     )
 
-    :: Extract PEM certificates from JSON response using Python (PY_CMD set at top)
+    rem Extract PEM certificates from JSON response using Python
     set "TEMP_FILE=%TEMP%\ns_api_response.json"
     set "CERT_FILE=%TEMP%\ns_certs.pem"
 
@@ -130,7 +130,7 @@ if "%use_local_certs%"=="1" (
         exit /b 1
     )
 
-    :: Check cert file is not empty
+    rem Check cert file is not empty
     for %%A in ("!CERT_FILE!") do if %%~zA==0 (
         echo Error: No PEM certificates extracted from API response
         del /f "!CERT_FILE!" 2>NUL
@@ -389,7 +389,7 @@ if %ERRORLEVEL% EQU 0 (
 echo.
 set "storage_explorer_certs_dir=%LOCALAPPDATA%\Programs\Microsoft Azure Storage Explorer\certs"
 if not exist "%storage_explorer_certs_dir%" (
-    :: Also check the older/alternative install path
+    rem Also check the older/alternative install path
     set "storage_explorer_certs_dir=%USERPROFILE%\AppData\Local\Programs\Microsoft Azure Storage Explorer\certs"
 )
 if exist "%storage_explorer_certs_dir%" (
@@ -423,12 +423,12 @@ if exist "%LOCALAPPDATA%\Claude\Claude.exe" set "claude_desktop_app=found"
 if defined claude_desktop_app (
     echo Claude Desktop is installed
 
-    :: Create config directory if it doesn't exist
+    rem Create config directory if it doesn't exist
     set "claude_desktop_config_dir=%APPDATA%\Claude"
     if not exist "!claude_desktop_config_dir!" mkdir "!claude_desktop_config_dir!"
     if not exist "%claude_desktop_config%" echo {} > "%claude_desktop_config%"
 
-    :: Backup config before modifying
+    rem Backup config before modifying
     copy /y "%claude_desktop_config%" "%claude_desktop_config%.backup" >NUL
 
     set "CERT_PATH=%certDir%\%certName%"
@@ -441,7 +441,7 @@ if defined claude_desktop_app (
         echo Claude Desktop configured
         echo echo Claude Desktop configured with NODE_EXTRA_CA_CERTS >> "%CONFIGURED_TOOLS_FILE%"
     ) else (
-        :: Restore backup on failure
+        rem Restore backup on failure
         copy /y "%claude_desktop_config%.backup" "%claude_desktop_config%" >NUL 2>NUL
         echo Warning: Failed to configure Claude Desktop
     )
@@ -498,7 +498,7 @@ echo.
 if exist "%~2" (
     echo %~1 is installed
 
-    :: Backup settings
+    rem Backup settings
     copy /y "%~2" "%~2.backup" >NUL
 
     set "VSCODE_CONFIG=%~2"
@@ -511,7 +511,7 @@ if exist "%~2" (
     ) else if !ERRORLEVEL! EQU 0 (
         echo %~1 configured with NODE_EXTRA_CA_CERTS in terminal environment
     ) else (
-        :: Restore backup on failure
+        rem Restore backup on failure
         copy /y "%~2.backup" "%~2" >NUL 2>NUL
         echo Warning: Failed to configure %~1
     )
