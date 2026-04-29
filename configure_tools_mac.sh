@@ -323,8 +323,27 @@ configure_tool "Oracle Cloud CLI" "OCI_CLI_CA_BUNDLE" "oci" ""
 configure_tool "Cargo Package Manager" "CARGO_HTTP_CAINFO" "cargo" ""
 configure_tool "Yarn" "" "yarnpkg" "yarnpkg config set httpsCaFilePath \"$certDir/$certName\""
 configure_tool "Claude CLI" "NODE_EXTRA_CA_CERTS" "claude" ""
-# Netskope CLI (httpx-based) honors NETSKOPE_CA_BUNDLE; also reads REQUESTS_CA_BUNDLE / SSL_CERT_FILE / CURL_CA_BUNDLE
-configure_tool "Netskope CLI" "NETSKOPE_CA_BUNDLE" "ntsk" ""
+
+# Netskope CLI (ntsk) — set ALL of these. Empirically, ntsk hits raw ssl/urllib
+# code paths that only honor SSL_CERT_FILE, even though its docs imply
+# NETSKOPE_CA_BUNDLE is enough. On a host without openssl/curl/python on PATH,
+# none of those vars get set elsewhere and ntsk fails with TLS errors.
+echo
+if command_exists "ntsk"; then
+  echo "Netskope CLI is installed"
+  ntsk --version 2>&1 || true
+  cert_path="$certDir/$certName"
+  for v in NETSKOPE_CA_BUNDLE SSL_CERT_FILE REQUESTS_CA_BUNDLE CURL_CA_BUNDLE; do
+    if [[ -n "${!v:-}" && "${!v}" == "$cert_path" ]]; then
+      echo "  $v already set in current shell"
+    else
+      add_export_to_shell "$v" "$cert_path"
+      echo "  $v configured"
+    fi
+  done
+else
+  echo "Netskope CLI is not installed"
+fi
 
 # Check if Azure Storage Explorer exists
 echo

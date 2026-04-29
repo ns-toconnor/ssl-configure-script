@@ -86,7 +86,7 @@ Where a tool honors an environment variable, the script exports it in the user's
 | npm | `npm config set cafile` |
 | Yarn | `yarn config set httpsCaFilePath` |
 | Claude CLI | `NODE_EXTRA_CA_CERTS` env var |
-| Netskope CLI (`ntsk` / `netskope`) | `NETSKOPE_CA_BUNDLE` env var |
+| Netskope CLI (`ntsk` / `netskope`) | `NETSKOPE_CA_BUNDLE` + `SSL_CERT_FILE` + `REQUESTS_CA_BUNDLE` + `CURL_CA_BUNDLE` env vars (ntsk hits raw ssl/urllib paths, so all four are needed when openssl/curl/python aren't on PATH) |
 | Ruby | `SSL_CERT_FILE` env var |
 | PHP Composer | `composer config --global cafile` |
 | Oracle Cloud CLI | `OCI_CLI_CA_BUNDLE` env var |

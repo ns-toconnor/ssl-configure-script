@@ -296,8 +296,27 @@ configure_tool("Cargo Package Manager", "CARGO_HTTP_CAINFO", "cargo")
 configure_tool("Yarn", None, "yarnpkg",
                f'yarnpkg config set httpsCaFilePath "{bundle_arg}"')
 configure_tool("Claude CLI", "NODE_EXTRA_CA_CERTS", "claude")
-# Netskope CLI (httpx-based) honors NETSKOPE_CA_BUNDLE; also reads REQUESTS_CA_BUNDLE / SSL_CERT_FILE / CURL_CA_BUNDLE
-configure_tool("Netskope CLI", "NETSKOPE_CA_BUNDLE", "ntsk")
+
+# Netskope CLI (ntsk) — set ALL of these. Empirically, ntsk hits raw ssl/urllib
+# code paths that only honor SSL_CERT_FILE, even though its docs imply
+# NETSKOPE_CA_BUNDLE is enough. On a host without openssl/curl/python on PATH,
+# none of those vars get set elsewhere and ntsk fails with TLS errors.
+print()
+if not command_exists("ntsk"):
+    print("Netskope CLI is not installed")
+else:
+    print("Netskope CLI is installed")
+    try:
+        subprocess.run(["ntsk", "--version"], stderr=subprocess.STDOUT, check=False)
+    except OSError:
+        pass
+    cert_path = str(bundle_path)
+    for v in ("NETSKOPE_CA_BUNDLE", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
+        if os.environ.get(v) == cert_path:
+            print(f"  {v} already set in current shell")
+        else:
+            set_env_var(v, cert_path)
+            print(f"  {v} configured")
 
 # --- Azure Storage Explorer ---
 print()
