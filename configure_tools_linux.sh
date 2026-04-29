@@ -5,6 +5,17 @@
 # Enable strict error handling
 set -euo pipefail
 
+# --- Output helpers (mirrors configure_tools_windows.ps1 formatting) ---
+if [ -t 1 ]; then
+  C_CYAN=$'\033[36m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_GRAY=$'\033[90m'; C_RESET=$'\033[0m'
+else
+  C_CYAN=''; C_GREEN=''; C_YELLOW=''; C_GRAY=''; C_RESET=''
+fi
+say_section() { echo; printf '%s--- %s ---%s\n' "$C_CYAN" "$*" "$C_RESET"; }
+say_ok()      { printf '%s[ok]%s   %s\n' "$C_GREEN"  "$C_RESET" "$*"; }
+say_skip()    { printf '%s[skip]%s %s\n' "$C_GRAY"   "$C_RESET" "$*"; }
+say_warn()    { printf '%s[warn]%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
+
 # Constants
 CURL_TIMEOUT=30
 CURL_MAX_TIME=60
@@ -85,14 +96,11 @@ NS_TENANT_CERT="$NS_CLIENT_CERT_DIR/nstenantcert.pem"
 use_local_certs=false
 
 if [[ -f "$NS_CA_CERT" && -f "$NS_TENANT_CERT" ]]; then
-  echo
-  echo "Netskope client is installed. Found local certificates:"
-  echo
-  echo "CA Certificate (nscacert.pem):"
-  openssl x509 -in "$NS_CA_CERT" -noout -subject 2>/dev/null | sed 's/^/  /'
-  echo
-  echo "Tenant Certificate (nstenantcert.pem):"
-  openssl x509 -in "$NS_TENANT_CERT" -noout -subject 2>/dev/null | sed 's/^/  /'
+  say_section "Local Netskope client certificates detected"
+  echo "  CA Certificate (nscacert.pem):"
+  openssl x509 -in "$NS_CA_CERT" -noout -subject 2>/dev/null | sed 's/^/    /'
+  echo "  Tenant Certificate (nstenantcert.pem):"
+  openssl x509 -in "$NS_TENANT_CERT" -noout -subject 2>/dev/null | sed 's/^/    /'
   echo
   read -p "Use these local certificates instead of the API? (Y/n) " -n 1 -r
   echo
@@ -133,7 +141,7 @@ command_exists() {
 
 # Function to create or update certificate bundle
 create_cert_bundle() {
-  echo "Creating cert bundle"
+  say_section "Building certificate bundle"
   local temp_file cert_file
   temp_file=$(mktemp)
   register_temp "$temp_file"
@@ -144,10 +152,10 @@ create_cert_bundle() {
     echo "Using local Netskope client certificates..."
     cat "$NS_TENANT_CERT" > "$bundle_file"
     cat "$NS_CA_CERT" >> "$bundle_file"
-    echo "Netskope certificates added from local client"
+    say_ok "Netskope certificates added from local client"
   else
     # Download tenant CA certificates via API
-    echo "Fetching Netskope tenant CA certificates..."
+    echo "Fetching Netskope tenant CA certificates from API..."
     local http_code
     http_code=$(curl -k --connect-timeout "$CURL_TIMEOUT" --max-time "$CURL_MAX_TIME" \
       --silent --show-error --write-out '%{http_code}' \
@@ -202,7 +210,7 @@ except (json.JSONDecodeError, KeyError) as e:
       exit 1
     fi
 
-    echo "Netskope certificates retrieved successfully"
+    say_ok "Netskope certificates retrieved successfully"
 
     # Write Netskope certs to bundle
     cp "$cert_file" "$bundle_file"
@@ -212,17 +220,17 @@ except (json.JSONDecodeError, KeyError) as e:
   echo "Downloading Mozilla CA bundle..."
   if ! curl -k --connect-timeout "$CURL_TIMEOUT" --max-time "$CURL_MAX_TIME" \
     --fail --silent --show-error "https://curl.se/ca/cacert.pem" >> "$bundle_file"; then
-    echo "Error: Failed to download Mozilla CA bundle"
+    say_warn "Failed to download Mozilla CA bundle"
     exit 1
   fi
 
   # Verify final bundle is not empty
   if [ ! -s "$bundle_file" ]; then
-    echo "Error: Certificate bundle is empty"
+    say_warn "Certificate bundle is empty"
     exit 1
   fi
 
-  echo "Certificate bundle created successfully: $bundle_file"
+  say_ok "Certificate bundle written: $bundle_file"
 }
 
 if [ -f "$certDir/$certName" ]; then
@@ -231,6 +239,8 @@ if [ -f "$certDir/$certName" ]; then
   echo
   if [[ $REPLY =~ ^[Yy]$ ]]; then
     create_cert_bundle
+  else
+    say_skip "Reusing existing bundle"
   fi
 else
   create_cert_bundle
@@ -263,35 +273,29 @@ configure_tool() {
   local check_command=$3
   local post_command=$4
 
-  echo
-  if command_exists "$check_command"; then
-    echo "$tool_name is installed"
+  if ! command_exists "$check_command"; then
+    say_skip "$tool_name not installed"
+    return
+  fi
 
-    # Try to show version (redirect stderr to handle tools that output version to stderr)
-    "$check_command" --version 2>&1 || true
-
-    if [[ -n "$env_var" ]]; then
-      local cert_path="$certDir/$certName"
-      # ${!env_var} only reflects the current shell; add_export_to_shell dedupes
-      # against the shell-config file, so re-running is safe either way.
-      if [[ -n "${!env_var:-}" && "${!env_var}" == "$cert_path" ]]; then
-        echo "$tool_name already configured in current shell"
-      else
-        add_export_to_shell "$env_var" "$cert_path"
-        echo "$tool_name configured"
-      fi
+  if [[ -n "$env_var" ]]; then
+    local cert_path="$certDir/$certName"
+    if [[ -n "${!env_var:-}" && "${!env_var}" == "$cert_path" ]] \
+       && grep -Fxq "export $env_var=\"$cert_path\"" "$SHELL_CONFIG" 2>/dev/null; then
+      say_skip "$tool_name already configured ($env_var)"
+    else
+      add_export_to_shell "$env_var" "$cert_path"
+      say_ok "$tool_name configured ($env_var)"
     fi
+  fi
 
-    if [[ -n "$post_command" ]]; then
-      if eval "$post_command"; then
-        echo "$post_command" >> "$CONFIGURED_TOOLS_FILE"
-        echo "$tool_name post-configuration completed"
-      else
-        echo "Warning: $tool_name post-configuration failed"
-      fi
+  if [[ -n "$post_command" ]]; then
+    if eval "$post_command" >/dev/null 2>&1; then
+      echo "$post_command" >> "$CONFIGURED_TOOLS_FILE"
+      [[ -z "$env_var" ]] && say_ok "$tool_name configured"
+    else
+      say_warn "$tool_name post-configuration failed"
     fi
-  else
-    echo "$tool_name is not installed"
   fi
 }
 
@@ -305,61 +309,67 @@ configure_tool() {
 chmod +x "$CONFIGURED_TOOLS_FILE"
 
 # Configure tools
-configure_tool "Git" "GIT_SSL_CAINFO" "git" ""
+say_section "Configuring CLIs (env-var based)"
 configure_tool "OpenSSL" "SSL_CERT_FILE" "openssl" ""
 configure_tool "cURL" "CURL_CA_BUNDLE" "curl" ""
 configure_tool "Python Requests Library" "REQUESTS_CA_BUNDLE" "python3" ""
 configure_tool "AWS CLI" "AWS_CA_BUNDLE" "aws" ""
-configure_tool "Google Cloud CLI" "" "gcloud" "gcloud config set core/custom_ca_certs_file \"$certDir/$certName\""
-configure_tool "NodeJS Package Manager (NPM)" "" "npm" "npm config set cafile \"$certDir/$certName\""
 configure_tool "NodeJS" "NODE_EXTRA_CA_CERTS" "node" ""
 # Ruby honors SSL_CERT_FILE (already set by OpenSSL entry above; this is a no-op on re-run)
 configure_tool "Ruby" "SSL_CERT_FILE" "ruby" ""
-configure_tool "PHP Composer" "" "composer" "composer config --global cafile \"$certDir/$certName\""
 # Azure CLI honors REQUESTS_CA_BUNDLE per Microsoft docs (already set above — safe no-op)
 configure_tool "Azure CLI" "REQUESTS_CA_BUNDLE" "az" ""
 configure_tool "Python PIP" "PIP_CERT" "pip3" ""
 configure_tool "Oracle Cloud CLI" "OCI_CLI_CA_BUNDLE" "oci" ""
 configure_tool "Cargo Package Manager" "CARGO_HTTP_CAINFO" "cargo" ""
-configure_tool "Yarn" "" "yarnpkg" "yarnpkg config set httpsCaFilePath \"$certDir/$certName\""
 configure_tool "Claude CLI" "NODE_EXTRA_CA_CERTS" "claude" ""
 
 # Netskope CLI (ntsk) — set ALL of these. Empirically, ntsk hits raw ssl/urllib
 # code paths that only honor SSL_CERT_FILE, even though its docs imply
 # NETSKOPE_CA_BUNDLE is enough. On a host without openssl/curl/python on PATH,
 # none of those vars get set elsewhere and ntsk fails with TLS errors.
-echo
 if command_exists "ntsk"; then
-  echo "Netskope CLI is installed"
-  ntsk --version 2>&1 || true
   cert_path="$certDir/$certName"
+  ntsk_changed=0
   for v in NETSKOPE_CA_BUNDLE SSL_CERT_FILE REQUESTS_CA_BUNDLE CURL_CA_BUNDLE; do
-    if [[ -n "${!v:-}" && "${!v}" == "$cert_path" ]]; then
-      echo "  $v already set in current shell"
+    if grep -Fxq "export $v=\"$cert_path\"" "$SHELL_CONFIG" 2>/dev/null; then
+      :
     else
       add_export_to_shell "$v" "$cert_path"
-      echo "  $v configured"
+      ntsk_changed=1
     fi
   done
+  if [[ $ntsk_changed -eq 1 ]]; then
+    say_ok "Netskope CLI configured (NETSKOPE_CA_BUNDLE + SSL_CERT_FILE + REQUESTS_CA_BUNDLE + CURL_CA_BUNDLE)"
+  else
+    say_skip "Netskope CLI already configured"
+  fi
 else
-  echo "Netskope CLI is not installed"
+  say_skip "Netskope CLI not installed"
 fi
 
-# Check if Azure Storage Explorer exists
-echo
+say_section "Configuring CLIs (native config)"
+configure_tool "Git" "GIT_SSL_CAINFO" "git" ""
+configure_tool "Google Cloud CLI" "" "gcloud" "gcloud config set core/custom_ca_certs_file \"$certDir/$certName\""
+configure_tool "NodeJS Package Manager (NPM)" "" "npm" "npm config set cafile \"$certDir/$certName\""
+configure_tool "PHP Composer" "" "composer" "composer config --global cafile \"$certDir/$certName\""
+configure_tool "Yarn" "" "yarnpkg" "yarnpkg config set httpsCaFilePath \"$certDir/$certName\""
+
+say_section "Configuring applications"
+
+# Azure Storage Explorer
 storage_explorer_certs_dir="$HOME/.config/StorageExplorer/certs"
 if [ -d "$storage_explorer_certs_dir" ]; then
-  echo "Azure Storage Explorer is installed"
   storage_explorer_cert="$storage_explorer_certs_dir/$certName"
   if [ -f "$storage_explorer_cert" ] && cmp -s "$certDir/$certName" "$storage_explorer_cert" 2>/dev/null; then
-    echo "Azure Storage Explorer already configured with current certificate"
+    say_skip "Azure Storage Explorer already configured"
   else
     cp "$certDir/$certName" "$storage_explorer_certs_dir/"
-    echo "Azure Storage Explorer configured"
+    say_ok "Azure Storage Explorer configured"
     echo "cp \"$certDir/$certName\" \"$storage_explorer_certs_dir/\"" >> "$CONFIGURED_TOOLS_FILE"
   fi
 else
-  echo "Azure Storage Explorer is not installed"
+  say_skip "Azure Storage Explorer not installed"
 fi
 
 # Claude Desktop
@@ -367,13 +377,12 @@ fi
 # field (per-server env lives under mcpServers.<name>.env), so we no longer write it.
 # Claude Desktop launched from a desktop entry should pick up NODE_EXTRA_CA_CERTS from
 # the user environment; if it does not, set it in ~/.profile or your DM's env config.
-echo
 if command_exists claude-desktop || [ -f "/usr/bin/claude-desktop" ] || [ -f "/opt/Claude/claude-desktop" ]; then
-  echo "Claude Desktop is installed"
-  echo "Note: ensure NODE_EXTRA_CA_CERTS is exported in the environment used to launch GUI apps,"
-  echo "      then restart Claude Desktop."
+  say_ok "Claude Desktop detected (NODE_EXTRA_CA_CERTS already exported via shell config)"
+  say_warn "Ensure NODE_EXTRA_CA_CERTS is in the environment used to launch GUI apps,"
+  echo "         then restart Claude Desktop."
 else
-  echo "Claude Desktop is not installed"
+  say_skip "Claude Desktop not installed"
 fi
 
 # Configure VS Code variants
@@ -382,10 +391,7 @@ configure_vscode_variant() {
   local settings_file=$2
   local exit_code
 
-  echo
   if [ -f "$settings_file" ]; then
-    echo "$variant_name is installed"
-
     cert_path="$certDir/$certName"
 
     # Backup existing settings
@@ -429,7 +435,6 @@ try:
     # Check if NODE_EXTRA_CA_CERTS is already set in terminal env
     terminal_env = settings.get('terminal.integrated.env.linux', {})
     if terminal_env.get('NODE_EXTRA_CA_CERTS') == cert_path:
-        print(f'{config_path}: already configured')
         sys.exit(2)
 
     # Set NODE_EXTRA_CA_CERTS in the integrated terminal environment
@@ -440,27 +445,26 @@ try:
     with open(config_path, 'w') as f:
         json.dump(settings, f, indent=2)
 
-    print(f'{config_path}: configured successfully')
     sys.exit(0)
 except Exception as e:
-    print(f'Error updating {config_path}: {e}')
+    print(f'Error updating {config_path}: {e}', file=sys.stderr)
     sys.exit(1)
 " && exit_code=0 || exit_code=$?
 
     if [ "$exit_code" -eq 0 ]; then
-      echo "$variant_name configured with NODE_EXTRA_CA_CERTS in terminal environment"
+      say_ok "$variant_name configured (NODE_EXTRA_CA_CERTS in integrated terminal)"
+    elif [ "$exit_code" -eq 2 ]; then
+      say_skip "$variant_name already configured"
     elif [ "$exit_code" -eq 1 ]; then
       # Restore backup on failure
       mv "${settings_file}.backup" "$settings_file" 2>/dev/null || true
-      echo "Warning: Failed to configure $variant_name"
+      say_warn "Failed to configure $variant_name"
     fi
 
     # Clean up backup
     rm -f "${settings_file}.backup"
-
-    echo "Note: Please restart $variant_name for changes to take effect"
   else
-    echo "$variant_name is not installed"
+    say_skip "$variant_name not installed"
   fi
 }
 
@@ -469,7 +473,12 @@ configure_vscode_variant "VS Code Insiders" "$HOME/.config/Code - Insiders/User/
 configure_vscode_variant "Cursor" "$HOME/.config/Cursor/User/settings.json"
 
 echo
-echo "Configuration complete!"
-echo "Please restart your terminal or run: source $SHELL_CONFIG"
+printf '%s============================================================%s\n' "$C_CYAN" "$C_RESET"
+printf '%s Configuration complete.%s\n' "$C_CYAN" "$C_RESET"
+echo "   Bundle:           $certDir/$certName"
+echo "   Replay script:    $CONFIGURED_TOOLS_FILE"
+echo "   Shell config:     $SHELL_CONFIG"
 echo
-echo "For silent deployment on other machines, run: source $CONFIGURED_TOOLS_FILE"
+echo "   Open a new terminal, or run: source $SHELL_CONFIG"
+echo "   For silent deployment elsewhere: source $CONFIGURED_TOOLS_FILE"
+printf '%s============================================================%s\n' "$C_CYAN" "$C_RESET"
