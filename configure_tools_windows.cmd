@@ -364,7 +364,8 @@ echo.
 where claude >NUL 2>&1
 if %ERRORLEVEL% EQU 0 (
     echo Claude CLI is installed
-    claude --version 2>&1
+    rem use 'call' so claude.cmd (npm shim) returns to the parent batch cleanly
+    call claude --version >NUL 2>&1
     call :setx_if_needed "Claude CLI" "NODE_EXTRA_CA_CERTS" "%certDir%\%certName%"
 ) else (
     echo Claude CLI is not installed
