@@ -41,18 +41,28 @@ register_temp() {
 }
 trap cleanup_temps EXIT
 
-# Check which shell environment is used (zsh or bash)
+# Pick the user's login-shell rc file. We rely on $SHELL (set by login) rather
+# than `ps -p $$`, since the running process is always bash here (the script's
+# shebang) and tells us nothing about the user's actual shell. macOS default
+# since Catalina is zsh.
 get_shell(){
-    local running_shell
-    running_shell=$(ps -p $$ -o comm= 2>/dev/null || echo "${SHELL##*/}")
-    echo "Shell used is $running_shell"
-    # Note: .zshenv is sourced for every zsh invocation (including scripts),
-    # which is what we want for tool CA trust but can affect non-interactive shells.
-    if [[ "$running_shell" == *"bash"* ]] || [[ "${SHELL}" == *"bash"* ]]; then
-        SHELL_CONFIG="$HOME/.bash_profile"
-    else
-        SHELL_CONFIG="$HOME/.zshenv"
-    fi
+    local login_shell="${SHELL##*/}"
+    case "$login_shell" in
+        zsh)
+            # .zshenv is sourced for every zsh invocation (including non-interactive
+            # ones, scripts, and GUI-launched terminals) — the right place for CA trust.
+            SHELL_CONFIG="$HOME/.zshenv"
+            ;;
+        bash)
+            # macOS reads ~/.bash_profile on login; ~/.bashrc only for non-login shells.
+            SHELL_CONFIG="$HOME/.bash_profile"
+            ;;
+        *)
+            # Unknown shell — default to .profile, which most POSIX shells read.
+            SHELL_CONFIG="$HOME/.profile"
+            ;;
+    esac
+    echo "Login shell: $login_shell  ->  using $SHELL_CONFIG"
 }
 get_shell
 
