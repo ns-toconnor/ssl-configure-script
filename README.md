@@ -19,16 +19,15 @@ Each script:
 | --- | --- | --- |
 | macOS | [configure_tools_mac.sh](configure_tools_mac.sh) | Netskope API (Bearer token) or local STAgent certs |
 | Linux | [configure_tools_linux.sh](configure_tools_linux.sh) | Netskope API (Bearer token) or local STAgent certs |
-| Windows | [configure_tools_windows.cmd](configure_tools_windows.cmd) | Netskope API (Bearer token) or local STAgent certs |
+| Windows | [configure_tools_windows.cmd](configure_tools_windows.cmd) (launcher) + [configure_tools_windows.ps1](configure_tools_windows.ps1) | Netskope API (Bearer token) or local STAgent certs |
 | Any (Python) | [universal_configure_tools.py](universal_configure_tools.py) | Netskope API (Bearer token) or local STAgent certs |
 
 If the Netskope client is installed locally, the script will offer to use `nscacert.pem` / `nstenantcert.pem` directly instead of calling the API. Otherwise you need a tenant **Bearer token** with permission to read `/api/v2/services/certs/subordinates`.
 
 ## Prerequisites
 
-- `python3` on PATH (used to parse the API response and edit JSON configs)
-- `curl` and `openssl`
-- Windows: PowerShell (ships with Windows 10+) — used to read the token without echoing it
+- **macOS / Linux**: `python3`, `curl`, and `openssl` on PATH
+- **Windows**: PowerShell 5.1 (ships with Windows 10+) or PowerShell 7+ (`pwsh`). The Windows path is implemented entirely in PowerShell — no `python3` or `curl` required. The `.cmd` file is a thin launcher that forwards to `configure_tools_windows.ps1`.
 
 ## Usage
 
@@ -66,7 +65,7 @@ Each script asks for:
 Each run emits a replay script next to the bundle:
 
 - **macOS / Linux**: `source <certDir>/configured_tools.sh` — must be sourced so `export` lines persist.
-- **Windows**: run `<certDir>\configured_tools.bat` — executes `setx` and tool-config commands.
+- **Windows**: run `<certDir>\configured_tools.ps1` — re-invokes `configure_tools_windows.ps1` with `-NonInteractive` against the existing bundle (no tenant prompt, no API token required). The main `.ps1` is copied next to the bundle so the deploy folder is self-contained; copy the bundle, `configure_tools_windows.ps1`, and `configured_tools.ps1` to another machine and run the replay script.
 
 Copy the bundle and the replay script to another machine to reproduce the same configuration without re-prompting.
 
@@ -93,7 +92,7 @@ Where a tool honors an environment variable, the script exports it in the user's
 | Oracle Cloud CLI | `OCI_CLI_CA_BUNDLE` env var |
 | Cargo (Rust) | `CARGO_HTTP_CAINFO` env var |
 | Azure Storage Explorer | Copies bundle into the app's `certs/` directory |
-| Claude Desktop | Adds `NODE_EXTRA_CA_CERTS` to `claude_desktop_config.json` (`env` key) |
+| Claude Desktop | Detect-only — Electron reads `NODE_EXTRA_CA_CERTS` from the user environment at launch (set by `setx` on Windows; macOS GUI apps may need `launchctl setenv`) |
 | VS Code / VS Code Insiders / Cursor | Adds `NODE_EXTRA_CA_CERTS` to `terminal.integrated.env.*` in `settings.json` |
 
 Note: Go (`crypto/x509`) picks up `SSL_CERT_FILE` automatically — it's already set by the OpenSSL entry, so there's no separate Go step.
@@ -102,7 +101,7 @@ Note: Go (`crypto/x509`) picks up `SSL_CERT_FILE` automatically — it's already
 
 - **New shells only** — `setx` (Windows) and shell-config exports take effect in new terminal sessions, not the one that ran the script.
 - **Restart GUI apps** — Claude Desktop, VS Code variants, and Azure Storage Explorer need to be restarted after configuration.
-- **Backup on edit** — JSON configs (Claude Desktop, VS Code) are backed up to `<file>.backup` during the edit and restored automatically if the script's Python patch fails.
+- **Backup on edit** — JSON configs (VS Code variants) are backed up to `<file>.backup` during the edit and restored automatically if the patch fails. The VS Code patch is JSONC-aware (preserves `https://` URLs and other comment-like content inside string literals).
 - **`REQUESTS_CA_BUNDLE` is shared** — Python Requests and Azure CLI both read it, so setting it once configures both.
 
 ### Python (any platform)

@@ -326,26 +326,49 @@ else:
 
 
 # --- Claude Desktop ---
-def patch_json_config(path, env_key):
-    """Patch a JSON config file so `env_key -> NODE_EXTRA_CA_CERTS` points at the bundle.
-    Returns 'already', 'configured', or raises on hard failure."""
+def strip_jsonc(s):
+    """Strip // and /* */ comments from JSONC, ignoring text inside string literals.
+    A naive regex (//.*?$) corrupts strings like "https://example.com"."""
+    out = []
+    i, n = 0, len(s)
+    in_string = False
+    while i < n:
+        c = s[i]
+        if in_string:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(s[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                in_string = False
+            i += 1
+        elif c == '"':
+            in_string = True
+            out.append(c)
+            i += 1
+        elif c == "/" and i + 1 < n and s[i + 1] == "/":
+            while i < n and s[i] != "\n":
+                i += 1
+        elif c == "/" and i + 1 < n and s[i + 1] == "*":
+            i += 2
+            while i + 1 < n and not (s[i] == "*" and s[i + 1] == "/"):
+                i += 1
+            i += 2
+        else:
+            out.append(c)
+            i += 1
+    return re.sub(r",\s*([}\]])", r"\1", "".join(out))
+
+
+def patch_vscode_settings(path, env_key):
+    """Set env_key -> NODE_EXTRA_CA_CERTS in a VS Code settings.json (JSONC).
+    Returns 'already' or 'configured'."""
     content = path.read_text() or "{}"
-    if env_key is None:
-        # Claude Desktop: env lives at top level
-        data = json.loads(content)
-        existing = data.get("env", {}).get("NODE_EXTRA_CA_CERTS")
-        if existing == str(bundle_path):
-            return "already"
-        data.setdefault("env", {})["NODE_EXTRA_CA_CERTS"] = str(bundle_path)
-    else:
-        # VS Code: strip JSONC comments first
-        stripped = re.sub(r"//.*?$", "", content, flags=re.MULTILINE)
-        stripped = re.sub(r"/\*.*?\*/", "", stripped, flags=re.DOTALL)
-        stripped = re.sub(r",\s*([}\]])", r"\1", stripped)
-        data = json.loads(stripped or "{}")
-        if data.get(env_key, {}).get("NODE_EXTRA_CA_CERTS") == str(bundle_path):
-            return "already"
-        data.setdefault(env_key, {})["NODE_EXTRA_CA_CERTS"] = str(bundle_path)
+    data = json.loads(strip_jsonc(content) or "{}")
+    if data.get(env_key, {}).get("NODE_EXTRA_CA_CERTS") == str(bundle_path):
+        return "already"
+    data.setdefault(env_key, {})["NODE_EXTRA_CA_CERTS"] = str(bundle_path)
     path.write_text(json.dumps(data, indent=2))
     return "configured"
 
@@ -374,33 +397,16 @@ else:
         )
     )
 
+# Detect-only: `env` at the top level of claude_desktop_config.json is not a recognized
+# field (per-server env lives under mcpServers.<name>.env). Claude Desktop is Electron
+# and reads NODE_EXTRA_CA_CERTS from the user environment at launch — covered by setx
+# on Windows and by shell-rc exports for terminal-launched apps elsewhere.
 if claude_installed:
     print("Claude Desktop is installed")
-    claude_config.parent.mkdir(parents=True, exist_ok=True)
-    if not claude_config.exists():
-        claude_config.write_text("{}")
-
-    backup = claude_config.with_suffix(claude_config.suffix + ".backup")
-    shutil.copy2(claude_config, backup)
-    try:
-        result = patch_json_config(claude_config, env_key=None)
-        if result == "already":
-            print("Claude Desktop already configured")
-        else:
-            print("Claude Desktop configured")
-            marker = ("echo Claude Desktop configured with NODE_EXTRA_CA_CERTS"
-                      if IS_WINDOWS else
-                      "echo 'Claude Desktop configured with NODE_EXTRA_CA_CERTS'")
-            append_tools_file(marker)
-    except Exception as e:
-        shutil.copy2(backup, claude_config)
-        print(f"Warning: Failed to configure Claude Desktop: {e}")
-    finally:
-        try:
-            backup.unlink()
-        except OSError:
-            pass
-    print("Note: Please restart Claude Desktop for changes to take effect")
+    if IS_MAC:
+        print("Note: macOS GUI apps do not inherit shell env vars. If needed, run:")
+        print(f'      launchctl setenv NODE_EXTRA_CA_CERTS "{bundle_path}"')
+    print("      then restart Claude Desktop.")
 else:
     print("Claude Desktop is not installed")
 
@@ -422,7 +428,7 @@ def configure_vscode_variant(name, settings_file):
     backup = settings_file.with_suffix(settings_file.suffix + ".backup")
     shutil.copy2(settings_file, backup)
     try:
-        result = patch_json_config(settings_file, env_key=VSCODE_ENV_KEY)
+        result = patch_vscode_settings(settings_file, env_key=VSCODE_ENV_KEY)
         if result == "already":
             print(f"{name}: already configured")
         else:

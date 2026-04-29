@@ -343,68 +343,18 @@ else
   echo "Azure Storage Explorer is not installed"
 fi
 
-# Configure Claude Desktop
+# Claude Desktop
+# Detect-only: `env` at the top level of claude_desktop_config.json is not a recognized
+# field (per-server env lives under mcpServers.<name>.env), so we no longer write it.
+# GUI apps on macOS do not inherit env vars from shell rc files; if Claude Desktop's
+# bundled Node needs the CA bundle, set it via:
+#   launchctl setenv NODE_EXTRA_CA_CERTS "$certDir/$certName"
 echo
-claude_desktop_config="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
-claude_desktop_app="/Applications/Claude.app"
-
-if [ -d "$claude_desktop_app" ]; then
+if [ -d "/Applications/Claude.app" ]; then
   echo "Claude Desktop is installed"
-
-  # Create config directory and file if they don't exist
-  claude_desktop_config_dir="$(dirname "$claude_desktop_config")"
-  if [ ! -d "$claude_desktop_config_dir" ]; then
-    mkdir -p "$claude_desktop_config_dir"
-  fi
-  if [ ! -f "$claude_desktop_config" ]; then
-    echo '{}' > "$claude_desktop_config"
-  fi
-
-  cert_path="$certDir/$certName"
-
-  # Backup config before modifying
-  cp "$claude_desktop_config" "${claude_desktop_config}.backup"
-
-  CONFIG_PATH="$claude_desktop_config" CERT_PATH="$cert_path" python3 -c "
-import json, os, sys
-
-config_path = os.environ['CONFIG_PATH']
-cert_path = os.environ['CERT_PATH']
-
-try:
-    with open(config_path, 'r') as f:
-        config = json.load(f)
-
-    # Check if already configured
-    if config.get('env', {}).get('NODE_EXTRA_CA_CERTS') == cert_path:
-        print('Claude Desktop already configured')
-        sys.exit(2)
-
-    # Add NODE_EXTRA_CA_CERTS to environment
-    if 'env' not in config:
-        config['env'] = {}
-
-    config['env']['NODE_EXTRA_CA_CERTS'] = cert_path
-
-    with open(config_path, 'w') as f:
-        json.dump(config, f, indent=2)
-
-    print('Claude Desktop configured successfully')
-    sys.exit(0)
-except Exception as e:
-    print(f'Error updating Claude Desktop config: {e}')
-    sys.exit(1)
-" && exit_code=0 || exit_code=$?
-
-  if [ "$exit_code" -eq 0 ]; then
-    echo "echo 'Claude Desktop configured with NODE_EXTRA_CA_CERTS'" >> "$CONFIGURED_TOOLS_FILE"
-  elif [ "$exit_code" -eq 1 ]; then
-    mv "${claude_desktop_config}.backup" "$claude_desktop_config" 2>/dev/null || true
-    echo "Warning: Failed to configure Claude Desktop"
-  fi
-  rm -f "${claude_desktop_config}.backup"
-
-  echo "Note: Please restart Claude Desktop for changes to take effect"
+  echo "Note: macOS GUI apps do not inherit shell env vars. If needed, run:"
+  echo "      launchctl setenv NODE_EXTRA_CA_CERTS \"$certDir/$certName\""
+  echo "      then restart Claude Desktop."
 else
   echo "Claude Desktop is not installed"
 fi
@@ -430,17 +380,34 @@ import json, os, re, sys
 config_path = os.environ['CONFIG_PATH']
 cert_path = os.environ['CERT_PATH']
 
+def strip_jsonc(s):
+    # String-aware: do not touch // or /* inside string literals (e.g. https:// URLs).
+    out, i, n, in_string = [], 0, len(s), False
+    while i < n:
+        c = s[i]
+        if in_string:
+            out.append(c)
+            if c == '\\\\' and i + 1 < n:
+                out.append(s[i+1]); i += 2; continue
+            if c == '\"': in_string = False
+            i += 1
+        elif c == '\"':
+            in_string = True; out.append(c); i += 1
+        elif c == '/' and i + 1 < n and s[i+1] == '/':
+            while i < n and s[i] != '\n': i += 1
+        elif c == '/' and i + 1 < n and s[i+1] == '*':
+            i += 2
+            while i + 1 < n and not (s[i] == '*' and s[i+1] == '/'): i += 1
+            i += 2
+        else:
+            out.append(c); i += 1
+    return re.sub(r',\s*([}\]])', r'\1', ''.join(out))
+
 try:
     with open(config_path, 'r') as f:
         content = f.read()
 
-    # Strip JSONC comments (single-line and block comments)
-    content = re.sub(r'//.*?$', '', content, flags=re.MULTILINE)
-    content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
-    # Strip trailing commas before } or ]
-    content = re.sub(r',\s*([}\]])', r'\1', content)
-
-    settings = json.loads(content)
+    settings = json.loads(strip_jsonc(content) or '{}')
 
     # Check if NODE_EXTRA_CA_CERTS is already set in terminal env
     terminal_env = settings.get('terminal.integrated.env.osx', {})
