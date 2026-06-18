@@ -26,6 +26,9 @@ HOME = Path.home()
 
 CURL_TIMEOUT = 60
 MOZILLA_BUNDLE_URL = "https://curl.se/ca/cacert.pem"
+# cacert.pem is ~230 KB; anything well below that is a captive-portal/proxy error page,
+# not the real bundle. Guards against silently writing junk into the trust store.
+MOZILLA_MIN_BYTES = 50000
 NETSKOPE_CERT_API_PATH = "/api/v2/services/certs/subordinates?purpose=tenant_ca"
 
 # SSL context that skips verification — we're bootstrapping trust, so the
@@ -166,11 +169,24 @@ def fetch_api_certs():
 
 def fetch_mozilla_bundle():
     print("Downloading Mozilla CA bundle...")
+    # Verify the TLS chain first — this download seeds the entire root trust store, so an
+    # unvalidated fetch is an injection vector. Verification succeeds whenever the host is
+    # NOT behind Netskope inspection; only then fall back to insecure (behind inspection the
+    # resigned cert isn't trusted yet — the very thing we're installing).
+    body = None
     try:
-        with urllib.request.urlopen(MOZILLA_BUNDLE_URL, timeout=CURL_TIMEOUT, context=INSECURE_CTX) as resp:
-            return resp.read()
-    except Exception as e:
-        die(f"Failed to download Mozilla CA bundle: {e}")
+        with urllib.request.urlopen(MOZILLA_BUNDLE_URL, timeout=CURL_TIMEOUT) as resp:
+            body = resp.read()
+    except Exception:
+        print("  Verified download failed (likely TLS inspection); retrying without verification.")
+        try:
+            with urllib.request.urlopen(MOZILLA_BUNDLE_URL, timeout=CURL_TIMEOUT, context=INSECURE_CTX) as resp:
+                body = resp.read()
+        except Exception as e:
+            die(f"Failed to download Mozilla CA bundle: {e}")
+    if len(body) < MOZILLA_MIN_BYTES:
+        die(f"Mozilla CA bundle download looks truncated ({len(body)} bytes) — aborting")
+    return body
 
 
 def build_bundle():
@@ -246,10 +262,6 @@ def configure_tool(tool_name, env_var, check_command, post_command=None):
         print(f"{tool_name} is not installed")
         return
     print(f"{tool_name} is installed")
-    try:
-        subprocess.run([check_command, "--version"], stderr=subprocess.STDOUT, check=False)
-    except OSError:
-        pass
 
     cert_path = str(bundle_path)
     if env_var:
@@ -306,10 +318,6 @@ if not command_exists("ntsk"):
     print("Netskope CLI is not installed")
 else:
     print("Netskope CLI is installed")
-    try:
-        subprocess.run(["ntsk", "--version"], stderr=subprocess.STDOUT, check=False)
-    except OSError:
-        pass
     cert_path = str(bundle_path)
     for v in ("NETSKOPE_CA_BUNDLE", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
         if os.environ.get(v) == cert_path:
@@ -382,14 +390,19 @@ def strip_jsonc(s):
 
 def patch_vscode_settings(path, env_key):
     """Set env_key -> NODE_EXTRA_CA_CERTS in a VS Code settings.json (JSONC).
-    Returns 'already' or 'configured'."""
+    Returns (status, had_comments) where status is 'already' or 'configured'.
+    had_comments flags that the rewrite (json.dump) dropped JSONC comments."""
     content = path.read_text() or "{}"
+    # Comment detection is for a user-facing warning only — the write below cannot preserve
+    # JSONC comments. Mirror the PowerShell heuristic: a line-comment at line start or a block
+    # comment anywhere. Strings containing "//" (e.g. URLs) won't match the line-start anchor.
+    had_comments = bool(re.search(r"(?m)^\s*//", content)) or "/*" in content
     data = json.loads(strip_jsonc(content) or "{}")
     if data.get(env_key, {}).get("NODE_EXTRA_CA_CERTS") == str(bundle_path):
-        return "already"
+        return "already", had_comments
     data.setdefault(env_key, {})["NODE_EXTRA_CA_CERTS"] = str(bundle_path)
     path.write_text(json.dumps(data, indent=2))
-    return "configured"
+    return "configured", had_comments
 
 
 print()
@@ -447,11 +460,13 @@ def configure_vscode_variant(name, settings_file):
     backup = settings_file.with_suffix(settings_file.suffix + ".backup")
     shutil.copy2(settings_file, backup)
     try:
-        result = patch_vscode_settings(settings_file, env_key=VSCODE_ENV_KEY)
+        result, had_comments = patch_vscode_settings(settings_file, env_key=VSCODE_ENV_KEY)
         if result == "already":
             print(f"{name}: already configured")
         else:
             print(f"{name} configured with NODE_EXTRA_CA_CERTS in terminal environment")
+            if had_comments:
+                print(f"  Note: comments in {name} settings.json were not preserved on rewrite.")
     except Exception as e:
         shutil.copy2(backup, settings_file)
         print(f"Warning: Failed to configure {name}: {e}")

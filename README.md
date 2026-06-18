@@ -17,10 +17,11 @@ Each script:
 
 | Platform | Script | Cert source |
 | --- | --- | --- |
-| macOS | [configure_tools_mac.sh](configure_tools_mac.sh) | Netskope API (Bearer token) or local STAgent certs |
-| Linux | [configure_tools_linux.sh](configure_tools_linux.sh) | Netskope API (Bearer token) or local STAgent certs |
+| macOS / Linux | [configure_tools_unix.sh](configure_tools_unix.sh) | Netskope API (Bearer token) or local STAgent certs |
 | Windows | [configure_tools_windows.cmd](configure_tools_windows.cmd) (launcher) + [configure_tools_windows.ps1](configure_tools_windows.ps1) | Netskope API (Bearer token) or local STAgent certs |
 | Any (Python) | [universal_configure_tools.py](universal_configure_tools.py) | Netskope API (Bearer token) or local STAgent certs |
+
+`configure_tools_unix.sh` auto-detects macOS vs Linux (via `uname`) and adjusts the shell rc file, STAgent cert path, and app config locations accordingly — it replaces the former separate `configure_tools_mac.sh` / `configure_tools_linux.sh`.
 
 If the Netskope client is installed locally, the script will offer to use `nscacert.pem` / `nstenantcert.pem` directly instead of calling the API. Otherwise you need a tenant **Bearer token** with permission to read `/api/v2/services/certs/subordinates`.
 
@@ -31,18 +32,11 @@ If the Netskope client is installed locally, the script will offer to use `nscac
 
 ## Usage
 
-### macOS
+### macOS / Linux
 
 ```bash
-chmod +x configure_tools_mac.sh
-./configure_tools_mac.sh
-```
-
-### Linux
-
-```bash
-chmod +x configure_tools_linux.sh
-./configure_tools_linux.sh
+chmod +x configure_tools_unix.sh
+./configure_tools_unix.sh
 ```
 
 ### Windows
@@ -101,7 +95,9 @@ Note: Go (`crypto/x509`) picks up `SSL_CERT_FILE` automatically — it's already
 
 - **New shells only** — `setx` (Windows) and shell-config exports take effect in new terminal sessions, not the one that ran the script.
 - **Restart GUI apps** — Claude Desktop, VS Code variants, and Azure Storage Explorer need to be restarted after configuration.
-- **Backup on edit** — JSON configs (VS Code variants) are backed up to `<file>.backup` during the edit and restored automatically if the patch fails. The VS Code patch is JSONC-aware (preserves `https://` URLs and other comment-like content inside string literals).
+- **Backup on edit** — JSON configs (VS Code variants) are backed up to `<file>.backup` during the edit and restored automatically if the patch fails. The JSONC parser is string-aware on **read** (it won't choke on `//` inside `https://` URLs), but the **write** is a plain JSON re-serialization — any `//` or `/* */` comments in your `settings.json` are not preserved. The scripts print a warning when they drop comments.
+- **Trust-store download is verified first** — the Mozilla root bundle (`curl.se/ca/cacert.pem`) is fetched with TLS verification enabled and only falls back to an unverified fetch if that fails (i.e. when the host is behind Netskope inspection and the resigned cert isn't trusted yet). A size sanity-check rejects truncated/captive-portal responses before they reach the bundle.
+- **API token stays off the process table** — the Unix script passes the Bearer token to `curl` via a mode-600 `--config` file rather than on the command line, so it isn't visible in `ps` on multi-user hosts.
 - **`REQUESTS_CA_BUNDLE` is shared** — Python Requests and Azure CLI both read it, so setting it once configures both.
 
 ### Python (any platform)
@@ -114,4 +110,4 @@ Stdlib only — no `pip install` needed.
 
 ## Other files
 
-- [check_ssl.js](check_ssl.js) — quick Node.js probe for verifying a TLS endpoint after configuration.
+- [check_ssl.js](check_ssl.js) — Node.js probe for verifying a TLS endpoint after configuration. Prints the presented certificate chain (leaf → root) and whether Node's active trust store (system roots + `NODE_EXTRA_CA_CERTS`) validated it. Usage: `node check_ssl.js [host[:port]] [path]` — exits non-zero if the chain didn't validate.

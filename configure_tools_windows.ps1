@@ -200,6 +200,29 @@ function Invoke-InsecureWebRequest {
     }
 }
 
+# For public downloads (the Mozilla root bundle), verify the TLS chain first — this seeds
+# the entire root trust store, so an unvalidated fetch is an injection vector. Verification
+# succeeds whenever the host is NOT behind Netskope inspection; only then do we fall back to
+# an insecure fetch (behind inspection the resigned cert isn't trusted yet — the very thing
+# we're installing).
+function Invoke-VerifiedDownload {
+    param(
+        [Parameter(Mandatory)][string]$Uri,
+        [Parameter(Mandatory)][string]$OutFile
+    )
+    try {
+        $params = @{ Uri = $Uri; UseBasicParsing = $true; TimeoutSec = 60; OutFile = $OutFile }
+        if ($PSVersionTable.PSVersion.Major -lt 6) {
+            [Net.ServicePointManager]::SecurityProtocol =
+                [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
+        }
+        Invoke-WebRequest @params | Out-Null
+    } catch {
+        Write-Warn2 'Verified download failed (likely TLS inspection); retrying without certificate verification.'
+        Invoke-InsecureWebRequest -Uri $Uri -OutFile $OutFile
+    }
+}
+
 # ============================================================
 # Parameter resolution (interactive)
 # ============================================================
@@ -324,7 +347,7 @@ function New-CertBundle {
         Write-Host 'Downloading Mozilla CA bundle...'
         $mozTemp = [System.IO.Path]::GetTempFileName()
         try {
-            Invoke-InsecureWebRequest -Uri 'https://curl.se/ca/cacert.pem' -OutFile $mozTemp
+            Invoke-VerifiedDownload -Uri 'https://curl.se/ca/cacert.pem' -OutFile $mozTemp
             if ((Get-Item $mozTemp).Length -lt 10000) {
                 throw "Mozilla CA bundle download looks truncated ($((Get-Item $mozTemp).Length) bytes)"
             }
@@ -360,7 +383,6 @@ $envTools = @(
     [pscustomobject]@{ Name = 'Oracle Cloud CLI';       Probes = @('oci');             EnvVar = 'OCI_CLI_CA_BUNDLE' }
     [pscustomobject]@{ Name = 'Cargo Package Manager';  Probes = @('cargo');           EnvVar = 'CARGO_HTTP_CAINFO' }
     [pscustomobject]@{ Name = 'Claude CLI';             Probes = @('claude');          EnvVar = 'NODE_EXTRA_CA_CERTS' }
-    [pscustomobject]@{ Name = 'Netskope CLI';           Probes = @('ntsk');            EnvVar = 'NETSKOPE_CA_BUNDLE' }
 )
 
 Write-Section 'Configuring CLIs (env-var based)'
@@ -371,6 +393,19 @@ foreach ($t in $envTools) {
     if ($changed) { Write-OK "$($t.Name) configured ($($t.EnvVar))" }
     else          { Write-Skip "$($t.Name) already configured" }
 }
+
+# Netskope CLI (ntsk) — set ALL of these, mirroring the Unix scripts. Empirically ntsk
+# hits raw ssl/urllib code paths that only honor SSL_CERT_FILE, even though its docs imply
+# NETSKOPE_CA_BUNDLE is enough. On a host without openssl/curl/python installed, none of
+# those vars get set by their own tool entries and ntsk fails with TLS errors.
+if (Test-Tool 'ntsk') {
+    $ntskChanged = $false
+    foreach ($v in @('NETSKOPE_CA_BUNDLE', 'SSL_CERT_FILE', 'REQUESTS_CA_BUNDLE', 'CURL_CA_BUNDLE')) {
+        if (Set-PersistentEnv -Name $v -Value $bundlePath) { $ntskChanged = $true }
+    }
+    if ($ntskChanged) { Write-OK 'Netskope CLI configured (NETSKOPE_CA_BUNDLE + SSL_CERT_FILE + REQUESTS_CA_BUNDLE + CURL_CA_BUNDLE)' }
+    else              { Write-Skip 'Netskope CLI already configured' }
+} else { Write-Skip 'Netskope CLI not installed' }
 
 Write-Section 'Configuring CLIs (native config)'
 

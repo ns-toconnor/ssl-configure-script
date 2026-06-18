@@ -1,9 +1,19 @@
 #!/bin/bash
-## This tool will try to detect common cli tools and will configure the Netskope SSL certificate bundle.
-## Uses the Netskope API to retrieve tenant CA certificates instead of the org key method.
+## Detects common CLI tools/apps on macOS or Linux and points them at a Netskope SSL
+## certificate bundle. Uses the Netskope API (Bearer token) or the local STAgent certs.
+##
+## This single script replaces the former configure_tools_mac.sh / configure_tools_linux.sh;
+## platform differences (rc file, STAgent path, app config locations) are detected via uname.
 
 # Enable strict error handling
 set -euo pipefail
+
+# --- Platform detection ---
+case "$(uname -s)" in
+  Darwin) IS_MAC=true;  IS_LINUX=false ;;
+  Linux)  IS_MAC=false; IS_LINUX=true  ;;
+  *) echo "Error: unsupported OS '$(uname -s)' (this script handles macOS and Linux; use universal_configure_tools.py elsewhere)"; exit 1 ;;
+esac
 
 # --- Output helpers (mirrors configure_tools_windows.ps1 formatting) ---
 if [ -t 1 ]; then
@@ -20,6 +30,10 @@ say_warn()    { printf '%s[warn]%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
 CURL_TIMEOUT=30
 CURL_MAX_TIME=60
 NETSKOPE_CERT_API_PATH="/api/v2/services/certs/subordinates?purpose=tenant_ca"
+MOZILLA_BUNDLE_URL="https://curl.se/ca/cacert.pem"
+# cacert.pem is ~230 KB; anything well below that is a captive-portal/proxy error page,
+# not the real bundle. Guards against silently writing junk into the trust store.
+MOZILLA_MIN_BYTES=50000
 
 # Require python3 up front — used for API response parsing and JSON config edits
 if ! command -v python3 >/dev/null 2>&1; then
@@ -41,21 +55,25 @@ register_temp() {
 }
 trap cleanup_temps EXIT
 
-# Pick the user's login-shell rc file. We rely on $SHELL (set by login) rather
-# than `ps -p $$`, since the running process is always bash here (the script's
-# shebang) and tells us nothing about the user's actual shell. macOS default
-# since Catalina is zsh.
+# Pick the user's login-shell rc file. We rely on $SHELL (set by login) rather than
+# `ps -p $$`, since the running process is always bash here (the script's shebang) and tells
+# us nothing about the user's actual shell. macOS default since Catalina is zsh.
 get_shell(){
     local login_shell="${SHELL##*/}"
     case "$login_shell" in
         zsh)
-            # .zshenv is sourced for every zsh invocation (including non-interactive
-            # ones, scripts, and GUI-launched terminals) — the right place for CA trust.
+            # .zshenv is sourced for every zsh invocation (including non-interactive ones,
+            # scripts, and GUI-launched terminals) — the right place for CA trust.
             SHELL_CONFIG="$HOME/.zshenv"
             ;;
         bash)
-            # macOS reads ~/.bash_profile on login; ~/.bashrc only for non-login shells.
-            SHELL_CONFIG="$HOME/.bash_profile"
+            # macOS reads ~/.bash_profile on login; most Linux distros source ~/.bashrc for
+            # interactive shells (login-shell propagation comes via ~/.bash_profile/~/.profile).
+            if [[ "$IS_MAC" == true ]]; then
+                SHELL_CONFIG="$HOME/.bash_profile"
+            else
+                SHELL_CONFIG="$HOME/.bashrc"
+            fi
             ;;
         *)
             # Unknown shell — default to .profile, which most POSIX shells read.
@@ -65,6 +83,19 @@ get_shell(){
     echo "Login shell: $login_shell  ->  using $SHELL_CONFIG"
 }
 get_shell
+
+# --- Platform-specific paths ---
+if [[ "$IS_MAC" == true ]]; then
+  NS_CLIENT_CERT_DIR="/Library/Application Support/Netskope/STAgent/data"
+  STORAGE_EXPLORER_CERTS_DIR="$HOME/Library/Application Support/StorageExplorer/certs"
+  VSCODE_ROOT="$HOME/Library/Application Support"
+  VSCODE_ENV_KEY="terminal.integrated.env.osx"
+else
+  NS_CLIENT_CERT_DIR="/opt/netskope/stagent/data"
+  STORAGE_EXPLORER_CERTS_DIR="$HOME/.config/StorageExplorer/certs"
+  VSCODE_ROOT="$HOME/.config"
+  VSCODE_ENV_KEY="terminal.integrated.env.linux"
+fi
 
 # Get Netskope tenant name
 read -p "Please provide full Netskope tenant name (ex: tenant-name.goskope.com): " tenantName
@@ -100,7 +131,6 @@ fi
 CONFIGURED_TOOLS_FILE="$certDir/configured_tools.sh"
 
 # Check for local Netskope client certificates
-NS_CLIENT_CERT_DIR="/Library/Application Support/Netskope/STAgent/data"
 NS_CA_CERT="$NS_CLIENT_CERT_DIR/nscacert.pem"
 NS_TENANT_CERT="$NS_CLIENT_CERT_DIR/nstenantcert.pem"
 use_local_certs=false
@@ -149,6 +179,22 @@ command_exists() {
   command -v "$1" >/dev/null 2>&1
 }
 
+# Download a public file with TLS verification first, falling back to an insecure fetch only
+# if verification fails. The Mozilla root bundle seeds the entire trust store, so an
+# unvalidated fetch is an injection vector; verification succeeds whenever the host is NOT
+# behind Netskope inspection. (Behind inspection the resigned cert isn't trusted yet — the
+# very thing we're installing — so the fallback is unavoidable there.)
+download_verified() {
+  local url=$1 out=$2
+  if curl --connect-timeout "$CURL_TIMEOUT" --max-time "$CURL_MAX_TIME" \
+       --fail --silent --show-error "$url" -o "$out" 2>/dev/null; then
+    return 0
+  fi
+  say_warn "Verified download failed (likely TLS inspection); retrying without verification"
+  curl -k --connect-timeout "$CURL_TIMEOUT" --max-time "$CURL_MAX_TIME" \
+    --fail --silent --show-error "$url" -o "$out"
+}
+
 # Function to create or update certificate bundle
 create_cert_bundle() {
   say_section "Building certificate bundle"
@@ -164,15 +210,20 @@ create_cert_bundle() {
     cat "$NS_CA_CERT" >> "$bundle_file"
     say_ok "Netskope certificates added from local client"
   else
-    # Download tenant CA certificates via API
+    # Download tenant CA certificates via API. The Bearer token is passed through a curl
+    # --config file (mode 600 via mktemp) rather than on argv, so it never appears in `ps`
+    # output on multi-user hosts.
     echo "Fetching Netskope tenant CA certificates from API..."
-    local http_code
+    local http_code api_cfg
+    api_cfg=$(mktemp)
+    register_temp "$api_cfg"
+    printf 'header = "Authorization: Bearer %s"\n' "$api_token" > "$api_cfg"
     http_code=$(curl -k --connect-timeout "$CURL_TIMEOUT" --max-time "$CURL_MAX_TIME" \
       --silent --show-error --write-out '%{http_code}' \
       -X 'GET' \
       "$NETSKOPE_CERT_API" \
       -H 'accept: application/json' \
-      -H "Authorization: Bearer $api_token" \
+      --config "$api_cfg" \
       -o "$temp_file") || true
 
     if [[ "$http_code" -ne 200 ]]; then
@@ -226,13 +277,21 @@ except (json.JSONDecodeError, KeyError) as e:
     cp "$cert_file" "$bundle_file"
   fi
 
-  # Download Mozilla CA bundle and append
+  # Download Mozilla CA bundle (verify-first), sanity-check size, then append
   echo "Downloading Mozilla CA bundle..."
-  if ! curl -k --connect-timeout "$CURL_TIMEOUT" --max-time "$CURL_MAX_TIME" \
-    --fail --silent --show-error "https://curl.se/ca/cacert.pem" >> "$bundle_file"; then
+  local moz_temp moz_size
+  moz_temp=$(mktemp)
+  register_temp "$moz_temp"
+  if ! download_verified "$MOZILLA_BUNDLE_URL" "$moz_temp"; then
     say_warn "Failed to download Mozilla CA bundle"
     exit 1
   fi
+  moz_size=$(wc -c < "$moz_temp" | tr -d ' ')
+  if [[ "$moz_size" -lt "$MOZILLA_MIN_BYTES" ]]; then
+    say_warn "Mozilla CA bundle download looks truncated ($moz_size bytes) — aborting"
+    exit 1
+  fi
+  cat "$moz_temp" >> "$bundle_file"
 
   # Verify final bundle is not empty
   if [ ! -s "$bundle_file" ]; then
@@ -264,8 +323,8 @@ add_export_to_shell() {
 
   # Check if already exists in shell config
   if ! grep -Fxq "$export_line" "$SHELL_CONFIG" 2>/dev/null; then
-    # Ensure file ends with a newline before appending so the new line doesn't
-    # get concatenated onto whatever was on the last line.
+    # Ensure file ends with a newline before appending so the new line doesn't get
+    # concatenated onto whatever was on the last line.
     if [[ -f "$SHELL_CONFIG" ]] && [[ -n "$(tail -c 1 "$SHELL_CONFIG" 2>/dev/null)" ]]; then
       printf '\n' >> "$SHELL_CONFIG"
     fi
@@ -290,8 +349,8 @@ configure_tool() {
 
   if [[ -n "$env_var" ]]; then
     local cert_path="$certDir/$certName"
-    # ${!env_var} only reflects the current shell; add_export_to_shell dedupes
-    # against the shell-config file, so re-running is safe either way.
+    # ${!env_var} only reflects the current shell; add_export_to_shell dedupes against the
+    # shell-config file, so re-running is safe either way.
     if [[ -n "${!env_var:-}" && "${!env_var}" == "$cert_path" ]] \
        && grep -Fxq "export $env_var=\"$cert_path\"" "$SHELL_CONFIG" 2>/dev/null; then
       say_skip "$tool_name already configured ($env_var)"
@@ -311,9 +370,8 @@ configure_tool() {
   fi
 }
 
-# Initialize silent-deployment script (intended to be sourced, not executed,
-# so export lines take effect — but also marked executable so post-commands
-# still run if invoked directly).
+# Initialize silent-deployment script (intended to be sourced, not executed, so export lines
+# take effect — but also marked executable so post-commands still run if invoked directly).
 {
   echo '#!/bin/bash'
   echo '# Silent deployment for configured tools — source this file to apply exports.'
@@ -336,10 +394,10 @@ configure_tool "Oracle Cloud CLI" "OCI_CLI_CA_BUNDLE" "oci" ""
 configure_tool "Cargo Package Manager" "CARGO_HTTP_CAINFO" "cargo" ""
 configure_tool "Claude CLI" "NODE_EXTRA_CA_CERTS" "claude" ""
 
-# Netskope CLI (ntsk) — set ALL of these. Empirically, ntsk hits raw ssl/urllib
-# code paths that only honor SSL_CERT_FILE, even though its docs imply
-# NETSKOPE_CA_BUNDLE is enough. On a host without openssl/curl/python on PATH,
-# none of those vars get set elsewhere and ntsk fails with TLS errors.
+# Netskope CLI (ntsk) — set ALL of these. Empirically, ntsk hits raw ssl/urllib code paths
+# that only honor SSL_CERT_FILE, even though its docs imply NETSKOPE_CA_BUNDLE is enough. On
+# a host without openssl/curl/python on PATH, none of those vars get set elsewhere and ntsk
+# fails with TLS errors.
 if command_exists "ntsk"; then
   cert_path="$certDir/$certName"
   ntsk_changed=0
@@ -370,52 +428,67 @@ configure_tool "Yarn" "" "yarnpkg" "yarnpkg config set httpsCaFilePath \"$certDi
 say_section "Configuring applications"
 
 # Azure Storage Explorer
-storage_explorer_certs_dir="$HOME/Library/Application Support/StorageExplorer/certs"
-if [ -d "$storage_explorer_certs_dir" ]; then
-  storage_explorer_cert="$storage_explorer_certs_dir/$certName"
+if [ -d "$STORAGE_EXPLORER_CERTS_DIR" ]; then
+  storage_explorer_cert="$STORAGE_EXPLORER_CERTS_DIR/$certName"
   if [ -f "$storage_explorer_cert" ] && cmp -s "$certDir/$certName" "$storage_explorer_cert" 2>/dev/null; then
     say_skip "Azure Storage Explorer already configured"
   else
-    cp "$certDir/$certName" "$storage_explorer_certs_dir/"
+    cp "$certDir/$certName" "$STORAGE_EXPLORER_CERTS_DIR/"
     say_ok "Azure Storage Explorer configured"
-    echo "cp \"$certDir/$certName\" \"$storage_explorer_certs_dir/\"" >> "$CONFIGURED_TOOLS_FILE"
+    echo "cp \"$certDir/$certName\" \"$STORAGE_EXPLORER_CERTS_DIR/\"" >> "$CONFIGURED_TOOLS_FILE"
   fi
 else
   say_skip "Azure Storage Explorer not installed"
 fi
 
 # Claude Desktop
-# Detect-only: `env` at the top level of claude_desktop_config.json is not a recognized
-# field (per-server env lives under mcpServers.<name>.env), so we no longer write it.
-# GUI apps on macOS do not inherit env vars from shell rc files; if Claude Desktop's
-# bundled Node needs the CA bundle, set it via:
-#   launchctl setenv NODE_EXTRA_CA_CERTS "$certDir/$certName"
-if [ -d "/Applications/Claude.app" ]; then
-  say_ok "Claude Desktop detected (NODE_EXTRA_CA_CERTS already exported via shell config)"
-  say_warn "macOS GUI apps do not inherit shell env vars. If needed, run:"
-  echo "         launchctl setenv NODE_EXTRA_CA_CERTS \"$certDir/$certName\""
-  echo "         then restart Claude Desktop."
+# Detect-only: `env` at the top level of claude_desktop_config.json is not a recognized field
+# (per-server env lives under mcpServers.<name>.env), so we no longer write it. Claude Desktop
+# is Electron and reads NODE_EXTRA_CA_CERTS from the user environment at launch.
+if [[ "$IS_MAC" == true ]]; then
+  if [ -d "/Applications/Claude.app" ]; then
+    say_ok "Claude Desktop detected (NODE_EXTRA_CA_CERTS already exported via shell config)"
+    say_warn "macOS GUI apps do not inherit shell env vars. If needed, run:"
+    echo "         launchctl setenv NODE_EXTRA_CA_CERTS \"$certDir/$certName\""
+    echo "         then restart Claude Desktop."
+  else
+    say_skip "Claude Desktop not installed"
+  fi
 else
-  say_skip "Claude Desktop not installed"
+  if command_exists claude-desktop || [ -f "/usr/bin/claude-desktop" ] || [ -f "/opt/Claude/claude-desktop" ]; then
+    say_ok "Claude Desktop detected (NODE_EXTRA_CA_CERTS already exported via shell config)"
+    say_warn "Ensure NODE_EXTRA_CA_CERTS is in the environment used to launch GUI apps,"
+    echo "         then restart Claude Desktop."
+  else
+    say_skip "Claude Desktop not installed"
+  fi
 fi
 
 # Configure VS Code variants
 configure_vscode_variant() {
   local variant_name=$1
   local settings_file=$2
-  local exit_code
+  local exit_code had_comments
 
   if [ -f "$settings_file" ]; then
     cert_path="$certDir/$certName"
 
+    # Note whether the original had JSONC comments — the python rewrite below (json.dump)
+    # cannot preserve them, so we warn the user when they'll be lost.
+    had_comments=0
+    if grep -Eq '^[[:space:]]*//' "$settings_file" 2>/dev/null || grep -q '/\*' "$settings_file" 2>/dev/null; then
+      had_comments=1
+    fi
+
     # Backup existing settings
     cp "$settings_file" "${settings_file}.backup"
 
-    CONFIG_PATH="$settings_file" CERT_PATH="$cert_path" python3 -c "
+    CONFIG_PATH="$settings_file" CERT_PATH="$cert_path" VSCODE_ENV_KEY="$VSCODE_ENV_KEY" python3 -c "
 import json, os, re, sys
 
 config_path = os.environ['CONFIG_PATH']
 cert_path = os.environ['CERT_PATH']
+env_key = os.environ['VSCODE_ENV_KEY']
 
 def strip_jsonc(s):
     # String-aware: do not touch // or /* inside string literals (e.g. https:// URLs).
@@ -447,14 +520,14 @@ try:
     settings = json.loads(strip_jsonc(content) or '{}')
 
     # Check if NODE_EXTRA_CA_CERTS is already set in terminal env
-    terminal_env = settings.get('terminal.integrated.env.osx', {})
+    terminal_env = settings.get(env_key, {})
     if terminal_env.get('NODE_EXTRA_CA_CERTS') == cert_path:
         sys.exit(2)
 
     # Set NODE_EXTRA_CA_CERTS in the integrated terminal environment
-    if 'terminal.integrated.env.osx' not in settings:
-        settings['terminal.integrated.env.osx'] = {}
-    settings['terminal.integrated.env.osx']['NODE_EXTRA_CA_CERTS'] = cert_path
+    if env_key not in settings:
+        settings[env_key] = {}
+    settings[env_key]['NODE_EXTRA_CA_CERTS'] = cert_path
 
     with open(config_path, 'w') as f:
         json.dump(settings, f, indent=2)
@@ -467,6 +540,9 @@ except Exception as e:
 
     if [ "$exit_code" -eq 0 ]; then
       say_ok "$variant_name configured (NODE_EXTRA_CA_CERTS in integrated terminal)"
+      if [ "$had_comments" -eq 1 ]; then
+        say_warn "  Comments in $variant_name settings.json were not preserved on rewrite."
+      fi
     elif [ "$exit_code" -eq 2 ]; then
       say_skip "$variant_name already configured"
     elif [ "$exit_code" -eq 1 ]; then
@@ -482,9 +558,9 @@ except Exception as e:
   fi
 }
 
-configure_vscode_variant "VS Code" "$HOME/Library/Application Support/Code/User/settings.json"
-configure_vscode_variant "VS Code Insiders" "$HOME/Library/Application Support/Code - Insiders/User/settings.json"
-configure_vscode_variant "Cursor" "$HOME/Library/Application Support/Cursor/User/settings.json"
+configure_vscode_variant "VS Code" "$VSCODE_ROOT/Code/User/settings.json"
+configure_vscode_variant "VS Code Insiders" "$VSCODE_ROOT/Code - Insiders/User/settings.json"
+configure_vscode_variant "Cursor" "$VSCODE_ROOT/Cursor/User/settings.json"
 
 echo
 printf '%s============================================================%s\n' "$C_CYAN" "$C_RESET"
