@@ -12,7 +12,8 @@ Each script:
 2. Detects which supported tools are installed.
 3. For each tool, sets the appropriate env var or runs the tool's config command.
 4. If Docker is present, writes ready-to-use container assets to `<certDir>/docker/` (see [Docker](#docker)).
-5. Writes a replay script (`configured_tools.sh` / `configured_tools.bat`) alongside the bundle for silent deployment to other machines.
+5. With `--k8s` (or when you accept the offer because `kubectl` is present), writes Kubernetes assets to `<certDir>/k8s/` (see [Kubernetes](#kubernetes)).
+6. Writes a replay script (`configured_tools.sh` / `configured_tools.bat`) alongside the bundle for silent deployment to other machines.
 
 ## Scripts
 
@@ -55,6 +56,18 @@ Each script asks for:
 - **Bundle directory** — default `~/netskope` (Unix) or `C:\netskope` (Windows)
 - **API Bearer token** — skipped if a local Netskope STAgent install is detected and accepted, or if `NETSKOPE_API_TOKEN` is set in the environment
 
+### Options
+
+| macOS / Linux / Python | Windows | Effect |
+| --- | --- | --- |
+| `--k8s` | `-K8s` | Also write Kubernetes assets to `<certDir>/k8s/` (see [Kubernetes](#kubernetes)) |
+| `--k8s-namespace NAME` | `-K8sNamespace NAME` | Namespace used in the Kubernetes manifests (default `default`) |
+| `--cert-dir DIR` | `-CertDir DIR` | Bundle directory — skips that prompt |
+| `--cert-name NAME` | `-CertName NAME` | Bundle filename — skips that prompt |
+| `--non-interactive` | `-NonInteractive` | Never prompt. Reuses the existing bundle (no tenant name or API token needed) and fails if there is none |
+
+With no options every script asks the same questions as before; the one addition is the Kubernetes offer (default: no) when `kubectl` is on PATH. `--non-interactive` re-applies the whole tool configuration (it is idempotent), not just the Kubernetes assets, and leaves running containers unpatched. The macOS / Linux and Python scripts also leave an existing `configured_tools.sh` / `.bat` untouched in this mode.
+
 ### Silent re-deployment
 
 Each run emits a replay script next to the bundle:
@@ -63,6 +76,8 @@ Each run emits a replay script next to the bundle:
 - **Windows**: run `<certDir>\configured_tools.ps1` — re-invokes `configure_tools_windows.ps1` with `-NonInteractive` against the existing bundle (no tenant prompt, no API token required). The main `.ps1` is copied next to the bundle so the deploy folder is self-contained; copy the bundle, `configure_tools_windows.ps1`, and `configured_tools.ps1` to another machine and run the replay script.
 
 Copy the bundle and the replay script to another machine to reproduce the same configuration without re-prompting.
+
+To rebuild the Kubernetes assets from an existing bundle without prompts, run `<certDir>/k8s/regenerate.sh` (macOS / Linux / Python; `regenerate.bat` for Python on Windows) or, on Windows PowerShell, `<certDir>\configured_tools.ps1 -K8s`. These re-run the script with `--non-interactive`, so the tool configuration is re-applied too.
 
 ## Tools configured
 
@@ -90,6 +105,7 @@ Where a tool honors an environment variable, the script exports it in the user's
 | Claude Desktop | Detect-only — Electron reads `NODE_EXTRA_CA_CERTS` from the user environment at launch (set by `setx` on Windows; macOS GUI apps may need `launchctl setenv`) |
 | VS Code / VS Code Insiders / Cursor | Adds `NODE_EXTRA_CA_CERTS` to `terminal.integrated.env.*` in `settings.json` |
 | Docker | Generates container CA assets in `<certDir>/docker/` and can patch running containers (see [Docker](#docker)) |
+| Kubernetes | Opt-in (`--k8s`): generates a ConfigMap, example Deployment, trust-manager Bundle and a containerd trust script in `<certDir>/k8s/` (see [Kubernetes](#kubernetes)) |
 
 Note: Go (`crypto/x509`) picks up `SSL_CERT_FILE` automatically — it's already set by the OpenSSL entry, so there's no separate Go step.
 
@@ -122,6 +138,33 @@ The daemon and the containers fail independently, and fixing one does not fix th
 - **The OS trust store is not sufficient on its own.** Node, Python `requests`, pip, Cargo and Git each carry their own CA list, so the generated Dockerfiles also set `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`, `PIP_CERT`, `GIT_SSL_CAINFO` and `CARGO_HTTP_CAINFO`. (Verified: Node rejects a Netskope-signed cert with `UNABLE_TO_VERIFY_LEAF_SIGNATURE` even after `update-ca-certificates`, and accepts it once `NODE_EXTRA_CA_CERTS` is set.)
 - **`.crt`, not `.pem`** — `update-ca-certificates` only picks up files with a `.crt` extension, which is why the container copy is named `netskope-ca.crt`.
 - Generated assets are ASCII with LF line endings and no BOM, so they work unchanged when the bundle is produced on Windows and consumed in a Linux container.
+
+## Kubernetes
+
+Pods use their image's trust store and nodes pull images with their own containerd, so neither is reached by the host configuration above — and cluster nodes have no Netskope Client. A cluster behind SSL inspection needs the Netskope CA delivered explicitly. This is opt-in: pass `--k8s` (`-K8s` on Windows), or answer yes when the script offers it because `kubectl` is on PATH. `--k8s-namespace NAME` (`-K8sNamespace`) sets the namespace used in the manifests (default `default`). The script writes a self-contained `<certDir>/k8s/` directory:
+
+| File | Use |
+| --- | --- |
+| `configmap.yaml` | ConfigMap `netskope-ca` holding the full bundle (under its real filename) and `netskope-ca.crt` (the Netskope chain only) |
+| `deployment-example.yaml` | Example Deployment that mounts the ConfigMap read-only at `/etc/netskope` and sets the CA variables |
+| `trust-manager-bundle.yaml` | Optional: the same result through cert-manager's trust-manager |
+| `trust-netskope-ca-on-node.sh` | Makes a node's **containerd** trust the CA (image pulls) |
+| `netskope-ca.crt` | The Netskope CA chain only — used by the node script |
+| `regenerate.sh` / `regenerate.bat` | Rebuild this directory from the existing bundle without prompts (macOS / Linux / Python; `.bat` for Python on Windows). On Windows PowerShell run `configured_tools.ps1 -K8s` instead |
+| `README.md` | The same guidance, next to the files |
+
+### Two separate problems
+
+Pod trust and node trust fail independently, and fixing one does not fix the other:
+
+- **The pods** need the CA in the workload's own trust store or CA variables — that is what `configmap.yaml` and `deployment-example.yaml` provide. A pod without it fails its own HTTPS calls.
+- **The nodes** pull images with the node's containerd, which does its own TLS to the registry, so a node without the CA leaves pods in `ImagePullBackOff` with `x509: certificate signed by unknown authority` before any container exists. `trust-netskope-ca-on-node.sh` (Linux, needs `sudo`) fixes this two ways: with no arguments it installs into the node's OS trust store, which covers every registry but restarts containerd; given registry names it writes `/etc/containerd/certs.d/<registry>/hosts.toml`, which takes effect on the next pull with no restart but only for those registries, and only if containerd's `config_path` points at that directory. On EKS, GKE and AKS a manual run is lost when nodes are replaced — put it in node bootstrap or a privileged DaemonSet.
+
+- **Baking beats mounting.** Putting the CA into the image (`Dockerfile.snippet` in the `docker/` directory) works wherever the image runs and needs no per-workload wiring; mount the ConfigMap for images you cannot rebuild.
+- **Apply the ConfigMap server-side.** The full bundle is about 220 KB, and client-side `kubectl apply` copies the whole object into the `last-applied-configuration` annotation, which is limited to 262144 bytes. Use `kubectl apply --server-side -f configmap.yaml` or `kubectl create -f configmap.yaml`.
+- **Mount read-only at `/etc/netskope`** — not over `/etc/ssl/certs`, and without `subPath`, which never picks up ConfigMap updates.
+- **Each variable points at the right file.** `NODE_EXTRA_CA_CERTS` *adds* to Node's built-in CAs, so it takes `netskope-ca.crt`. `REQUESTS_CA_BUNDLE`, `PIP_CERT`, `SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`, `CARGO_HTTP_CAINFO` and `AWS_CA_BUNDLE` *replace* the default store, so they must point at the full bundle, which includes the Mozilla roots. Java reads none of these and needs its own truststore; .NET on Linux reads only `SSL_CERT_FILE` and `SSL_CERT_DIR`.
+- **Rotating the CA:** re-run the script, re-apply the ConfigMap, then `kubectl rollout restart` the workloads — most applications read their CAs once at startup.
 
 ## Notes
 
