@@ -1108,6 +1108,104 @@ including `NODE_EXTRA_CA_CERTS`, points at `/etc/netskope/ca-bundle.pem`.
 kubectl exec -n <namespace> deploy/netskope-ca-example -- sh -c 'ls -l /etc/netskope; env | grep -E "CA|CERT"'
 ```
 '@
+$k8sNodeSh = @'
+#!/bin/sh
+## Makes the node's containerd trust the Netskope CA, so image pulls succeed behind SSL
+## inspection. This is separate from the CA inside pods - the node does its own TLS to the
+## registry, so a pod can be set up correctly and still sit in ImagePullBackOff with
+## "x509: certificate signed by unknown authority". Linux nodes only; run with sudo. Safe to
+## re-run.
+##
+##   sudo ./trust-netskope-ca-on-node.sh
+##       Install into the node's OS trust store, which covers every registry. Restarts
+##       containerd, but only when the CA was added or changed.
+##
+##   sudo ./trust-netskope-ca-on-node.sh myreg.example.com:5000 ...
+##       Write /etc/containerd/certs.d/<registry>/hosts.toml (plus a copy of the CA) for each
+##       registry. Takes effect on the next pull with no restart, but only for the registries
+##       named, and ONLY if containerd's config_path points at /etc/containerd/certs.d (see
+##       the warning this mode prints). The directory name must match the registry exactly as
+##       it appears in the image reference, port included.
+##
+## On EKS, GKE and AKS, nodes are replaced by upgrades and autoscaling, so a one-off run is
+## lost. This usually belongs in node bootstrap (launch template user data, startup script,
+## custom node image) or in a privileged DaemonSet that mounts the host filesystem.
+set -eu
+
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ca="$here/netskope-ca.crt"
+certs_d=/etc/containerd/certs.d
+[ -f "$ca" ] || { echo "Error: netskope-ca.crt not found next to this script" >&2; exit 1; }
+[ "$(uname -s)" = Linux ] || { echo "Error: Linux nodes only" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || { echo "Error: run this with sudo" >&2; exit 1; }
+
+# Copy $1 over $2 unless $2 already has identical content. Returns 1 when nothing changed.
+install_if_changed() {
+  if [ -f "$2" ] && cmp -s "$1" "$2"; then
+    return 1
+  fi
+  cp "$1" "$2" || exit 1
+  chmod 644 "$2" || exit 1
+}
+
+if [ "$#" -gt 0 ]; then
+  for reg in "$@"; do
+    case "$reg" in
+      ''|.*|*[!A-Za-z0-9._:-]*) echo "Error: invalid registry name '$reg'" >&2; exit 1 ;;
+    esac
+    dir="$certs_d/$reg"
+    mkdir -p "$dir"
+    changed=no
+    if install_if_changed "$ca" "$dir/ca.crt"; then changed=yes; fi
+    tmp=$(mktemp)
+    printf 'server = "https://%s"\nca = "%s/ca.crt"\n' "$reg" "$dir" > "$tmp"
+    if install_if_changed "$tmp" "$dir/hosts.toml"; then changed=yes; fi
+    rm -f "$tmp"
+    if [ "$changed" = yes ]; then
+      echo "[ok]   $reg: $dir/hosts.toml"
+    else
+      echo "[ok]   $reg: already configured"
+    fi
+  done
+
+  if grep -qs "^[[:space:]]*config_path[[:space:]]*=[[:space:]]*\"$certs_d/*\"" /etc/containerd/config.toml; then
+    echo "Takes effect on the next pull - no containerd restart needed."
+  else
+    echo "[warn] These files only work if containerd's registry config_path points at $certs_d,"
+    echo "       and /etc/containerd/config.toml does not set it. Add one of these (the table"
+    echo "       depends on your containerd version) and restart containerd once:"
+    echo "         containerd 1.x: [plugins.\"io.containerd.grpc.v1.cri\".registry]"
+    echo "         containerd 2.x: [plugins.\"io.containerd.cri.v1.images\".registry]"
+    echo "           config_path = \"$certs_d\""
+  fi
+  exit 0
+fi
+
+if [ -d /usr/local/share/ca-certificates ]; then
+  dir=/usr/local/share/ca-certificates; update='update-ca-certificates'
+elif [ -d /etc/pki/ca-trust/source/anchors ]; then
+  dir=/etc/pki/ca-trust/source/anchors; update='update-ca-trust extract'
+elif [ -d /etc/pki/trust/anchors ]; then
+  dir=/etc/pki/trust/anchors; update='update-ca-certificates'
+else
+  echo "Error: no CA trust directory found on this node" >&2
+  exit 1
+fi
+
+if ! install_if_changed "$ca" "$dir/netskope-ca.crt"; then
+  echo "[ok]   Netskope CA already installed in $dir - nothing to do (containerd not restarted)"
+  exit 0
+fi
+$update
+echo "[ok]   Netskope CA installed in $dir"
+
+if command -v systemctl >/dev/null 2>&1 && systemctl restart containerd; then
+  echo "[ok]   containerd restarted"
+else
+  echo "[warn] Could not restart containerd - restart it yourself to pick up the new CA" >&2
+  echo "       (k3s and RKE2 embed containerd: restart the k3s / rke2 service instead)" >&2
+fi
+'@
 
 # Fill in the namespace and bundle name of a template.
 function Format-K8sTemplate([string]$Template) {
@@ -1176,6 +1274,7 @@ function Write-K8sAssets {
     Write-DockerAsset -Path (Join-Path $k8sAssetDir 'deployment-example.yaml')   -Content (Format-K8sTemplate $k8sDeployment)
     Write-DockerAsset -Path (Join-Path $k8sAssetDir 'trust-manager-bundle.yaml') -Content $trustManager
     Write-DockerAsset -Path (Join-Path $k8sAssetDir 'README.md')                 -Content (Format-K8sTemplate $k8sReadme)
+    Write-DockerAsset -Path (Join-Path $k8sAssetDir 'trust-netskope-ca-on-node.sh') -Content (Format-K8sTemplate $k8sNodeSh)
     return $true
 }
 
