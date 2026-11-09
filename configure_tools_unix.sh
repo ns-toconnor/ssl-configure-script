@@ -35,6 +35,63 @@ MOZILLA_BUNDLE_URL="https://curl.se/ca/cacert.pem"
 # not the real bundle. Guards against silently writing junk into the trust store.
 MOZILLA_MIN_BYTES=50000
 
+# --- Command-line options ---
+# With no options the script is fully interactive, exactly as before. --cert-dir / --cert-name
+# pre-answer the matching prompt; --non-interactive and --k8s are described in usage().
+K8S=false
+K8S_NAMESPACE=default
+K8S_NAMESPACE_SET=false
+CERT_DIR_ARG=""
+CERT_NAME_ARG=""
+NON_INTERACTIVE=false
+
+usage() {
+  cat <<'USAGE'
+Usage: configure_tools_unix.sh [options]
+
+With no options the script asks for everything it needs.
+
+  --k8s                 Also write Kubernetes CA assets to <certDir>/k8s/
+  --k8s-namespace NAME  Namespace used in the Kubernetes manifests (default: default)
+  --cert-dir DIR        Bundle directory (skips that prompt)
+  --cert-name NAME      Bundle filename (skips that prompt)
+  --non-interactive     Never prompt. Reuses the existing bundle in --cert-dir/--cert-name,
+                        so no tenant name or API token is needed. The tool configuration is
+                        re-applied (it is idempotent) and configured_tools.sh is left as it
+                        is. Fails if the bundle does not exist yet.
+  -h, --help            Show this help
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --k8s)             K8S=true; shift ;;
+    --non-interactive) NON_INTERACTIVE=true; shift ;;
+    -h|--help)         usage; exit 0 ;;
+    --k8s-namespace|--cert-dir|--cert-name)
+      [[ $# -ge 2 ]] || { echo "Error: $1 requires a value" >&2; exit 2; }
+      case "$1" in
+        --k8s-namespace) K8S_NAMESPACE=$2; K8S_NAMESPACE_SET=true ;;
+        --cert-dir)      CERT_DIR_ARG=$2 ;;
+        --cert-name)     CERT_NAME_ARG=$2 ;;
+      esac
+      shift 2 ;;
+    --k8s-namespace=*) K8S_NAMESPACE=${1#*=}; K8S_NAMESPACE_SET=true; shift ;;
+    --cert-dir=*)      CERT_DIR_ARG=${1#*=}; shift ;;
+    --cert-name=*)     CERT_NAME_ARG=${1#*=}; shift ;;
+    *) echo "Error: unknown option '$1'" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+# The namespace ends up in YAML, so hold it to a Kubernetes DNS-1123 label.
+valid_k8s_namespace() {
+  [[ "$1" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ && ${#1} -le 63 ]]
+}
+if ! valid_k8s_namespace "$K8S_NAMESPACE"; then
+  echo "Error: invalid --k8s-namespace '$K8S_NAMESPACE' (lowercase letters, digits and '-', at most 63 characters)" >&2
+  exit 2
+fi
+
 # Require python3 up front — used for API response parsing and JSON config edits
 if ! command -v python3 >/dev/null 2>&1; then
   echo "Error: python3 is required"
@@ -97,29 +154,48 @@ else
   VSCODE_ENV_KEY="terminal.integrated.env.linux"
 fi
 
-# Get Netskope tenant name
-read -p "Please provide full Netskope tenant name (ex: tenant-name.goskope.com): " tenantName
-if [[ -z "$tenantName" ]]; then
-  echo "Error: Tenant name cannot be empty"
-  exit 1
-fi
+# Get Netskope tenant name. --non-interactive reuses an existing bundle instead of building
+# one, so there is nothing to fetch and no tenant is needed.
+if [[ "$NON_INTERACTIVE" == true ]]; then
+  tenantName=""
+else
+  read -p "Please provide full Netskope tenant name (ex: tenant-name.goskope.com): " tenantName
+  if [[ -z "$tenantName" ]]; then
+    echo "Error: Tenant name cannot be empty"
+    exit 1
+  fi
 
-# Validate tenant name format (basic check)
-if [[ ! "$tenantName" =~ ^[a-zA-Z0-9.-]+$ ]]; then
-  echo "Error: Invalid tenant name format"
-  exit 1
+  # Validate tenant name format (basic check)
+  if [[ ! "$tenantName" =~ ^[a-zA-Z0-9.-]+$ ]]; then
+    echo "Error: Invalid tenant name format"
+    exit 1
+  fi
 fi
 
 NETSKOPE_CERT_API="https://$tenantName$NETSKOPE_CERT_API_PATH"
 
-# Set Certificate bundle name and location
-read -p "Please provide certificate bundle name [netskope-cert-bundle.pem]: " certName
-certName=${certName:-netskope-cert-bundle.pem}
-read -p "Please provide certificate bundle location [~/netskope]: " certDir
-certDir=${certDir:-~/netskope}
+# Set Certificate bundle name and location (--cert-name / --cert-dir replace the prompts)
+if [[ -n "$CERT_NAME_ARG" || "$NON_INTERACTIVE" == true ]]; then
+  certName=${CERT_NAME_ARG:-netskope-cert-bundle.pem}
+else
+  read -p "Please provide certificate bundle name [netskope-cert-bundle.pem]: " certName
+  certName=${certName:-netskope-cert-bundle.pem}
+fi
+if [[ -n "$CERT_DIR_ARG" || "$NON_INTERACTIVE" == true ]]; then
+  certDir=${CERT_DIR_ARG:-~/netskope}
+else
+  read -p "Please provide certificate bundle location [~/netskope]: " certDir
+  certDir=${certDir:-~/netskope}
+fi
 
 # Expand tilde properly
 certDir="${certDir/#\~/$HOME}"
+
+if [[ "$NON_INTERACTIVE" == true && ! -f "$certDir/$certName" ]]; then
+  echo "Error: --non-interactive reuses an existing bundle, but $certDir/$certName does not exist" >&2
+  echo "       Run the script once interactively to build it." >&2
+  exit 1
+fi
 
 if [ ! -d "$certDir" ]; then
   echo "$certDir does not exist."
@@ -129,6 +205,14 @@ fi
 
 # Silent-deployment script lives alongside the bundle, not in CWD
 CONFIGURED_TOOLS_FILE="$certDir/configured_tools.sh"
+REPLAY_FILE="$CONFIGURED_TOOLS_FILE"
+if [[ "$NON_INTERACTIVE" == true && -f "$REPLAY_FILE" ]]; then
+  # A replay re-applies the configuration but must not rewrite the replay script: re-runs skip
+  # exports that are already set in the current shell, so a fresh file would lose those lines.
+  # Record into a scratch file instead and leave the existing replay script untouched.
+  CONFIGURED_TOOLS_FILE=$(mktemp)
+  register_temp "$CONFIGURED_TOOLS_FILE"
+fi
 
 # Netskope-only certs, split out of the full bundle. Container trust stores already ship the
 # Mozilla roots, so what they need is just the Netskope CA chain — and OS trust-store tools
@@ -141,7 +225,7 @@ NS_CA_CERT="$NS_CLIENT_CERT_DIR/nscacert.pem"
 NS_TENANT_CERT="$NS_CLIENT_CERT_DIR/nstenantcert.pem"
 use_local_certs=false
 
-if [[ -f "$NS_CA_CERT" && -f "$NS_TENANT_CERT" ]]; then
+if [[ -f "$NS_CA_CERT" && -f "$NS_TENANT_CERT" && "$NON_INTERACTIVE" != true ]]; then
   say_section "Local Netskope client certificates detected"
   echo "  CA Certificate (nscacert.pem):"
   openssl x509 -in "$NS_CA_CERT" -noout -subject 2>/dev/null | sed 's/^/    /'
@@ -157,7 +241,7 @@ fi
 
 # Get API token for certificate retrieval (only needed if not using local certs)
 api_token=""
-if [[ "$use_local_certs" == false ]]; then
+if [[ "$use_local_certs" == false && "$NON_INTERACTIVE" != true ]]; then
   if [[ -n "${NETSKOPE_API_TOKEN:-}" ]]; then
     echo
     echo "Found NETSKOPE_API_TOKEN environment variable."
@@ -314,8 +398,12 @@ except (json.JSONDecodeError, KeyError) as e:
 
 if [ -f "$certDir/$certName" ]; then
   echo "$certName already exists in $certDir."
-  read -p "Recreate Certificate Bundle? (y/N) " -n 1 -r
-  echo
+  if [[ "$NON_INTERACTIVE" == true ]]; then
+    REPLY=n
+  else
+    read -p "Recreate Certificate Bundle? (y/N) " -n 1 -r
+    echo
+  fi
   if [[ $REPLY =~ ^[Yy]$ ]]; then
     create_cert_bundle
   else
@@ -724,7 +812,9 @@ if command_exists docker; then
 
   # `docker ps` fails when the daemon is not running (Docker Desktop stopped, no socket
   # permission); the assets above are still useful, so treat it as a soft skip.
-  if running_containers=$(docker ps --format '{{.Names}}' 2>/dev/null) && [[ -n "$running_containers" ]]; then
+  if [[ "$NON_INTERACTIVE" == true ]]; then
+    say_skip "Running containers left unchanged (non-interactive)"
+  elif running_containers=$(docker ps --format '{{.Names}}' 2>/dev/null) && [[ -n "$running_containers" ]]; then
     echo "  Running containers:"
     echo "$running_containers" | sed 's/^/    /'
     read -p "  Install the Netskope CA into these running containers now? (y/N) " -n 1 -r
@@ -888,10 +978,10 @@ echo
 printf '%s============================================================%s\n' "$C_CYAN" "$C_RESET"
 printf '%s Configuration complete.%s\n' "$C_CYAN" "$C_RESET"
 echo "   Bundle:           $certDir/$certName"
-echo "   Replay script:    $CONFIGURED_TOOLS_FILE"
+echo "   Replay script:    $REPLAY_FILE"
 echo "   Shell config:     $SHELL_CONFIG"
 if [ -d "$DOCKER_ASSET_DIR" ]; then echo "   Docker assets:    $DOCKER_ASSET_DIR"; fi
 echo
 echo "   Open a new terminal, or run: source $SHELL_CONFIG"
-echo "   For silent deployment elsewhere: source $CONFIGURED_TOOLS_FILE"
+echo "   For silent deployment elsewhere: source $REPLAY_FILE"
 printf '%s============================================================%s\n' "$C_CYAN" "$C_RESET"

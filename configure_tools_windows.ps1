@@ -40,6 +40,14 @@
     Fail rather than prompt. With an existing bundle, this defaults to reusing the bundle
     (deploy-script semantics).
 
+.PARAMETER K8s
+    Also write Kubernetes CA assets (ConfigMap, example Deployment, trust-manager Bundle and a
+    node trust script) to <CertDir>\k8s. Without this switch, and when kubectl is on PATH, an
+    interactive run offers to do it (default: no).
+
+.PARAMETER K8sNamespace
+    Namespace used in the Kubernetes manifests. Default: default.
+
 .EXAMPLE
     .\configure_tools_windows.ps1
     Interactive run.
@@ -47,6 +55,10 @@
 .EXAMPLE
     .\configure_tools_windows.ps1 -TenantName tenant.goskope.com -UseLocalCerts -NonInteractive
     Silent run using locally-installed Netskope client certs.
+
+.EXAMPLE
+    .\configure_tools_windows.ps1 -K8s -K8sNamespace my-team
+    Interactive run that also writes the Kubernetes assets for the "my-team" namespace.
 #>
 
 [CmdletBinding()]
@@ -56,10 +68,21 @@ param(
     [string]$CertDir     = 'C:\netskope',
     [string]$ApiToken,
     [switch]$UseLocalCerts,
-    [switch]$NonInteractive
+    [switch]$NonInteractive,
+    [switch]$K8s,
+    [string]$K8sNamespace = 'default'
 )
 
 $ErrorActionPreference = 'Stop'
+
+# The namespace ends up in YAML, so hold it to a Kubernetes DNS-1123 label (-cmatch: the
+# default -match is case-insensitive).
+function Test-K8sNamespace([string]$Name) {
+    return ($Name.Length -le 63) -and ($Name -cmatch '^[a-z0-9]([-a-z0-9]*[a-z0-9])?\z')
+}
+if (-not (Test-K8sNamespace $K8sNamespace)) {
+    throw "Invalid -K8sNamespace '$K8sNamespace' (lowercase letters, digits and '-', at most 63 characters)"
+}
 
 # ============================================================
 # Helpers
@@ -981,6 +1004,12 @@ $replay = @"
 # Pre-requisite: the cert bundle must already exist at:
 #   $bundlePath
 # Copy it from the source machine before running this script.
+#
+# Add -K8s [-K8sNamespace <name>] to also (re)generate the Kubernetes assets in:
+#   $CertDir\k8s
+
+[CmdletBinding()]
+param([switch]`$K8s, [string]`$K8sNamespace)
 
 `$ErrorActionPreference = 'Stop'
 `$here   = Split-Path -Parent `$MyInvocation.MyCommand.Path
@@ -996,7 +1025,11 @@ if (-not (Test-Path `$main)) {
     exit 1
 }
 
-& `$main -CertName '$CertName' -CertDir '$CertDir'$tenantArg -NonInteractive
+`$k8sArgs = @()
+if (`$K8s) { `$k8sArgs += '-K8s' }
+if (`$K8sNamespace) { `$k8sArgs += @('-K8sNamespace', `$K8sNamespace) }
+
+& `$main -CertName '$CertName' -CertDir '$CertDir'$tenantArg -NonInteractive @k8sArgs
 "@
 
 Set-Utf8NoBom -Path $deployPath -Content $replay
