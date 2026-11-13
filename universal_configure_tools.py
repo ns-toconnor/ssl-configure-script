@@ -6,6 +6,8 @@ Netskope SSL-inspection CA bundle. The bundle is fetched either from the
 Netskope API (with a Bearer token) or, when the Netskope client is installed,
 from the local STAgent data directory. Stdlib only — no third-party deps.
 """
+import argparse
+import atexit
 import json
 import os
 import platform
@@ -14,6 +16,7 @@ import shutil
 import ssl
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from getpass import getpass
@@ -50,7 +53,7 @@ def detect_shell_config():
     return HOME / ".bashrc"
 
 
-SHELL_CONFIG = detect_shell_config()
+SHELL_CONFIG = None  # set by main(): detect_shell_config() prints
 
 _NS_CLIENT_DIRS = {
     "Darwin": Path("/Library/Application Support/Netskope/STAgent/data"),
@@ -70,65 +73,6 @@ def prompt(message, default):
 def die(msg):
     print(f"Error: {msg}")
     sys.exit(1)
-
-
-# --- Interactive prompts ---
-
-tenant_name = input(
-    "Please provide full Netskope tenant name (ex: tenant-name.goskope.com): "
-).strip()
-if not tenant_name:
-    die("Tenant name cannot be empty")
-if not re.fullmatch(r"[a-zA-Z0-9.-]+", tenant_name):
-    die("Invalid tenant name format")
-
-NETSKOPE_CERT_API = f"https://{tenant_name}{NETSKOPE_CERT_API_PATH}"
-
-cert_name = prompt("Please provide certificate bundle name", "netskope-cert-bundle.pem")
-default_dir = r"C:\netskope" if IS_WINDOWS else "~/netskope"
-cert_dir = Path(os.path.expanduser(prompt("Please provide certificate bundle location", default_dir)))
-cert_dir.mkdir(parents=True, exist_ok=True)
-
-bundle_path = cert_dir / cert_name
-configured_tools_file = cert_dir / ("configured_tools.bat" if IS_WINDOWS else "configured_tools.sh")
-
-# Netskope-only certs, split out of the full bundle. Container trust stores already ship the
-# Mozilla roots, so what they need is just the Netskope CA chain — and OS trust-store tools
-# (update-ca-certificates / update-ca-trust) only pick up files with a .crt extension.
-netskope_ca_path = cert_dir / "netskope-ca.crt"
-docker_dir = cert_dir / "docker"
-
-# --- Local client cert detection ---
-use_local_certs = False
-if NS_CA_CERT and NS_CA_CERT.exists() and NS_TENANT_CERT.exists():
-    print("\nNetskope client is installed. Found local certificates:")
-    if shutil.which("openssl"):
-        for label, path in (("CA Certificate (nscacert.pem)", NS_CA_CERT),
-                            ("Tenant Certificate (nstenantcert.pem)", NS_TENANT_CERT)):
-            try:
-                subj = subprocess.check_output(
-                    ["openssl", "x509", "-in", str(path), "-noout", "-subject"],
-                    text=True,
-                ).strip()
-                print(f"  {label}: {subj}")
-            except (subprocess.CalledProcessError, OSError):
-                pass
-    if input("Use these local certificates instead of the API? (Y/n) ").strip().lower() != "n":
-        use_local_certs = True
-
-# --- API token ---
-api_token = ""
-if not use_local_certs:
-    env_token = os.environ.get("NETSKOPE_API_TOKEN", "")
-    if env_token:
-        print("\nFound NETSKOPE_API_TOKEN environment variable.")
-        print(f"Token: {env_token[:8]}...")
-        if input("Use this token? (Y/n) ").strip().lower() != "n":
-            api_token = env_token
-    if not api_token:
-        api_token = getpass("Please provide the Netskope API Bearer token: ").strip()
-        if not api_token:
-            die("API token cannot be empty")
 
 
 # --- Bundle construction ---
@@ -218,25 +162,6 @@ def build_bundle():
     print(f"Certificate bundle created successfully: {bundle_path}")
 
 
-if bundle_path.exists():
-    print(f"{cert_name} already exists in {cert_dir}.")
-    if input("Recreate Certificate Bundle? (y/N) ").strip().lower() == "y":
-        build_bundle()
-else:
-    build_bundle()
-
-# --- Silent-deployment script initialization ---
-if IS_WINDOWS:
-    configured_tools_file.write_text(
-        "@echo off\n:: Silent deployment for configured tools\n"
-    )
-else:
-    configured_tools_file.write_text(
-        "#!/bin/bash\n# Silent deployment for configured tools — source this file to apply exports.\n"
-    )
-    os.chmod(configured_tools_file, 0o755)
-
-
 def append_tools_file(line):
     with open(configured_tools_file, "a") as f:
         f.write(line + "\n")
@@ -290,52 +215,6 @@ def configure_tool(tool_name, env_var, check_command, post_command=None):
         except subprocess.CalledProcessError:
             print(f"Warning: {tool_name} post-configuration failed")
 
-
-bundle_arg = str(bundle_path)
-
-# Git: Windows uses `git config`; Unix uses GIT_SSL_CAINFO (matches shell scripts).
-if IS_WINDOWS:
-    configure_tool("Git", None, "git", f'git config --global http.sslCAInfo "{bundle_arg}"')
-else:
-    configure_tool("Git", "GIT_SSL_CAINFO", "git")
-configure_tool("OpenSSL", "SSL_CERT_FILE", "openssl")
-configure_tool("cURL", "CURL_CA_BUNDLE", "curl")
-configure_tool("Python Requests Library", "REQUESTS_CA_BUNDLE", "python3")
-configure_tool("AWS CLI", "AWS_CA_BUNDLE", "aws")
-configure_tool("Google Cloud CLI", None, "gcloud",
-               f'gcloud config set core/custom_ca_certs_file "{bundle_arg}"')
-configure_tool("NodeJS Package Manager (NPM)", None, "npm",
-               f'npm config set cafile "{bundle_arg}"')
-configure_tool("NodeJS", "NODE_EXTRA_CA_CERTS", "node")
-# Ruby honors SSL_CERT_FILE (already set by OpenSSL entry — no-op on re-run)
-configure_tool("Ruby", "SSL_CERT_FILE", "ruby")
-configure_tool("PHP Composer", None, "composer",
-               f'composer config --global cafile "{bundle_arg}"')
-# Azure CLI honors REQUESTS_CA_BUNDLE (same var as Python Requests — safe no-op)
-configure_tool("Azure CLI", "REQUESTS_CA_BUNDLE", "az")
-configure_tool("Python PIP", "PIP_CERT", "pip3")
-configure_tool("Oracle Cloud CLI", "OCI_CLI_CA_BUNDLE", "oci")
-configure_tool("Cargo Package Manager", "CARGO_HTTP_CAINFO", "cargo")
-configure_tool("Yarn", None, "yarnpkg",
-               f'yarnpkg config set httpsCaFilePath "{bundle_arg}"')
-configure_tool("Claude CLI", "NODE_EXTRA_CA_CERTS", "claude")
-
-# Netskope CLI (ntsk) — set ALL of these. Empirically, ntsk hits raw ssl/urllib
-# code paths that only honor SSL_CERT_FILE, even though its docs imply
-# NETSKOPE_CA_BUNDLE is enough. On a host without openssl/curl/python on PATH,
-# none of those vars get set elsewhere and ntsk fails with TLS errors.
-print()
-if not command_exists("ntsk"):
-    print("Netskope CLI is not installed")
-else:
-    print("Netskope CLI is installed")
-    cert_path = str(bundle_path)
-    for v in ("NETSKOPE_CA_BUNDLE", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
-        if os.environ.get(v) == cert_path:
-            print(f"  {v} already set in current shell")
-        else:
-            set_env_var(v, cert_path)
-            print(f"  {v} configured")
 
 # --- Docker -----------------------------------------------------------------
 # Containers carry their own trust store, so nothing configured above reaches them. The
@@ -769,58 +648,425 @@ def install_ca_in_container(name, ca_file):
         print(f"  [warn] {name}: failed to install the Netskope CA")
 
 
-print()
-if not command_exists("docker"):
-    print("Docker is not installed")
-else:
-    print("Docker is installed")
-    write_docker_assets()
-    print(f"Docker build assets written: {docker_dir}")
 
-    containers = running_containers()
-    if not containers:
-        print("No running containers to patch (or the Docker daemon is not reachable)")
+# --- Kubernetes -------------------------------------------------------------
+# Pods use their image's trust store, and nodes pull images with their own containerd, so
+# neither is reached by the host configuration above. Unlike the Docker assets these are
+# opt-in: pass --k8s, or answer y at the prompt when kubectl is installed.
+#
+# <cert dir>/k8s/ gets a ConfigMap carrying the CA, an example Deployment that mounts it, an
+# optional trust-manager Bundle and a README. The full bundle is ~220 KB, so the ConfigMap
+# must not be applied client-side - see the comment at the top of configmap.yaml.
+
+K8S_CONFIGMAP_HEAD = """\
+# Netskope CA trust for Kubernetes workloads, generated by the ssl-configure scripts.
+#
+# Two keys, for two kinds of client:
+#   @@BUNDLE@@
+#       Netskope CA chain + Mozilla roots. For the variables that REPLACE a client's default
+#       store (REQUESTS_CA_BUNDLE, SSL_CERT_FILE, CURL_CA_BUNDLE, ...).
+#   netskope-ca.crt
+#       Netskope CA chain only. For NODE_EXTRA_CA_CERTS, which ADDS to Node's built-in CAs.
+#
+# NOTE: the full bundle is about 220 KB. Client-side "kubectl apply" stores the whole object in
+# the kubectl.kubernetes.io/last-applied-configuration annotation, which is limited to 262144
+# bytes, so it fails for this ConfigMap. Use one of:
+#   kubectl apply --server-side -f configmap.yaml
+#   kubectl create -f configmap.yaml        (kubectl replace -f configmap.yaml to update)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: netskope-ca
+  namespace: @@NAMESPACE@@
+data:
+"""
+
+K8S_DEPLOYMENT = """\
+# Example Deployment that trusts the Netskope CA through the "netskope-ca" ConfigMap
+# (configmap.yaml). Apply the ConfigMap first, then adapt this to your own workload.
+#
+# The ConfigMap is mounted read-only at /etc/netskope. Do not mount it over /etc/ssl/certs, and
+# do not use subPath: subPath mounts never pick up ConfigMap updates.
+#
+# Java does not read any of these variables and needs its own truststore. .NET on Linux reads
+# only SSL_CERT_FILE and SSL_CERT_DIR. Other runtimes may need their own setup.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: netskope-ca-example
+  namespace: @@NAMESPACE@@
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: netskope-ca-example
+  template:
+    metadata:
+      labels:
+        app: netskope-ca-example
+    spec:
+      containers:
+        - name: app
+          image: ubuntu:24.04 # replace with your own image
+          command: ["sleep", "infinity"]
+          env:
+            # Adds to Node's built-in CAs, so the Netskope chain alone is enough.
+            - name: NODE_EXTRA_CA_CERTS
+              value: /etc/netskope/netskope-ca.crt
+            # These REPLACE the default store, so they must point at the full bundle, which
+            # includes the Mozilla roots.
+            - name: REQUESTS_CA_BUNDLE
+              value: /etc/netskope/@@BUNDLE@@
+            - name: PIP_CERT
+              value: /etc/netskope/@@BUNDLE@@
+            - name: SSL_CERT_FILE
+              value: /etc/netskope/@@BUNDLE@@
+            - name: CURL_CA_BUNDLE
+              value: /etc/netskope/@@BUNDLE@@
+            - name: GIT_SSL_CAINFO
+              value: /etc/netskope/@@BUNDLE@@
+            - name: CARGO_HTTP_CAINFO
+              value: /etc/netskope/@@BUNDLE@@
+            - name: AWS_CA_BUNDLE
+              value: /etc/netskope/@@BUNDLE@@
+          volumeMounts:
+            - name: netskope-ca
+              mountPath: /etc/netskope
+              readOnly: true
+      volumes:
+        - name: netskope-ca
+          configMap:
+            name: netskope-ca
+"""
+
+K8S_TRUST_MANAGER_HEAD = """\
+# Optional: only for clusters that run cert-manager's trust-manager
+# (https://cert-manager.io/docs/trust/trust-manager/). Use this INSTEAD of configmap.yaml, not
+# alongside it: both produce a ConfigMap named "netskope-ca".
+#
+# trust-manager reads the source ConfigMap below (it must live in trust-manager's trust
+# namespace, "cert-manager" by default) and writes one merged bundle, the default public CAs
+# plus the Netskope chain, into a ConfigMap named "netskope-ca" in every namespace labelled
+# netskope-ca=enabled:
+#   kubectl label namespace @@NAMESPACE@@ netskope-ca=enabled
+#
+# With this route the merged bundle already contains the Netskope chain, so EVERY variable in
+# deployment-example.yaml, including NODE_EXTRA_CA_CERTS, points at /etc/netskope/ca-bundle.pem.
+#
+# useDefaultCAs needs trust-manager's default CA package to be enabled. Unlike configmap.yaml
+# this file is small, so plain "kubectl apply -f trust-manager-bundle.yaml" works.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: netskope-ca-source
+  namespace: cert-manager
+data:
+"""
+
+K8S_TRUST_MANAGER_TAIL = """\
+---
+apiVersion: trust.cert-manager.io/v1alpha1
+kind: Bundle
+metadata:
+  name: netskope-ca
+spec:
+  sources:
+    - useDefaultCAs: true
+    - configMap:
+        name: netskope-ca-source
+        key: netskope-ca.crt
+  target:
+    configMap:
+      key: ca-bundle.pem
+    namespaceSelector:
+      matchLabels:
+        netskope-ca: enabled
+"""
+
+K8S_README = """\
+# Netskope certificates for Kubernetes
+
+Pods use the trust store of their own image, so the host configuration does not reach them.
+There is no Netskope Client on cluster nodes either, which is why these files carry the CA
+instead. Pick whichever of these matches how the cluster is run:
+
+| File | Use |
+| --- | --- |
+| `configmap.yaml` | ConfigMap `netskope-ca` holding the full bundle and the Netskope-only chain |
+| `deployment-example.yaml` | Example Deployment that mounts the ConfigMap and points the CA variables at it |
+| `trust-manager-bundle.yaml` | Optional: the same result through cert-manager's trust-manager |
+| `trust-netskope-ca-on-node.sh` | Make the node's containerd trust the CA (image pulls) |
+| `netskope-ca.crt` | The Netskope CA chain only - used by the node script |
+
+To rebuild these files from the existing bundle without any prompts, run `regenerate.sh` in
+this directory if there is one (macOS / Linux / Python), or `configured_tools.ps1 -K8s` on
+Windows PowerShell.
+
+## Two separate problems
+
+Pod trust and node trust fail independently, and fixing one does not fix the other:
+
+- **The pods** need the CA in the trust store, or the CA variables, of the workload itself.
+  That is what `configmap.yaml` and `deployment-example.yaml` provide. A pod without it fails
+  its own HTTPS calls.
+- **The nodes** pull images with the node's containerd, which does its own TLS to the
+  registry. A node without the CA leaves pods in `ErrImagePull` / `ImagePullBackOff` with
+  `x509: certificate signed by unknown authority` before any container exists.
+  `trust-netskope-ca-on-node.sh` (Linux, needs `sudo`) fixes this two ways: with no
+  arguments it installs into the node's OS trust store, which covers every registry but
+  restarts containerd; given registry names it writes
+  `/etc/containerd/certs.d/<registry>/hosts.toml`, which takes effect on the next pull with
+  no restart but only for those registries, and only if containerd's `config_path` points at
+  that directory. On EKS, GKE and AKS a manual run is lost when nodes are replaced, so put
+  it in node bootstrap or a privileged DaemonSet instead. k3s and RKE2 embed their own
+  containerd: restart the k3s / rke2 service rather than `containerd`.
+
+## Pods
+
+- **Baking beats mounting.** Putting the CA into the image (see `Dockerfile.snippet` in the
+  `docker/` directory) works wherever the image runs and needs no per-workload wiring.
+  Mount the ConfigMap for images you cannot rebuild.
+- **Apply the ConfigMap with `kubectl apply --server-side -f configmap.yaml` or
+  `kubectl create -f configmap.yaml`.** The full bundle is about 220 KB, and client-side
+  `kubectl apply` copies the whole object into the `last-applied-configuration` annotation,
+  which is limited to 262144 bytes.
+- **Mount it read-only at `/etc/netskope`.** Do not mount over `/etc/ssl/certs`, and do not
+  use `subPath`: subPath mounts never pick up ConfigMap updates.
+- **Pick the right file for each variable.** `NODE_EXTRA_CA_CERTS` adds to Node's built-in
+  CAs, so it takes `netskope-ca.crt`. `REQUESTS_CA_BUNDLE`, `PIP_CERT`, `SSL_CERT_FILE`,
+  `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`, `CARGO_HTTP_CAINFO` and `AWS_CA_BUNDLE` replace the
+  default store, so they must point at the full bundle, which includes the Mozilla roots.
+- **Java and .NET.** Java reads none of these variables and needs a truststore of its own.
+  .NET on Linux reads only `SSL_CERT_FILE` and `SSL_CERT_DIR`.
+
+## trust-manager
+
+If the cluster already runs cert-manager's trust-manager, `trust-manager-bundle.yaml` lets it
+build the merged bundle (default public CAs plus the Netskope chain) and publish it as a
+ConfigMap in every namespace labelled `netskope-ca=enabled`. Use it instead of
+`configmap.yaml`. The merged bundle already contains the Netskope chain, so every variable,
+including `NODE_EXTRA_CA_CERTS`, points at `/etc/netskope/ca-bundle.pem`.
+
+## Rotating the CA
+
+1. Re-run the script to rebuild the bundle.
+2. Re-apply the ConfigMap: `kubectl apply --server-side -f configmap.yaml` (with
+   trust-manager, re-apply `trust-manager-bundle.yaml`).
+3. Restart the workloads: `kubectl rollout restart deployment/<name> -n <namespace>`. Most
+   applications read their CAs once at startup, so a changed file is not enough.
+4. On nodes that trust the CA, re-run `trust-netskope-ca-on-node.sh`.
+
+## Verify
+
+```
+kubectl exec -n <namespace> deploy/netskope-ca-example -- sh -c 'ls -l /etc/netskope; env | grep -E "CA|CERT"'
+```
+"""
+
+K8S_NODE_SH = """\
+#!/bin/sh
+## Makes the node's containerd trust the Netskope CA, so image pulls succeed behind SSL
+## inspection. This is separate from the CA inside pods - the node does its own TLS to the
+## registry, so a pod can be set up correctly and still sit in ImagePullBackOff with
+## "x509: certificate signed by unknown authority". Linux nodes only; run with sudo. Safe to
+## re-run.
+##
+##   sudo ./trust-netskope-ca-on-node.sh
+##       Install into the node's OS trust store, which covers every registry. Restarts
+##       containerd, but only when the CA was added or changed.
+##
+##   sudo ./trust-netskope-ca-on-node.sh myreg.example.com:5000 ...
+##       Write /etc/containerd/certs.d/<registry>/hosts.toml (plus a copy of the CA) for each
+##       registry. Takes effect on the next pull with no restart, but only for the registries
+##       named, and ONLY if containerd's config_path points at /etc/containerd/certs.d (see
+##       the warning this mode prints). The directory name must match the registry exactly as
+##       it appears in the image reference, port included.
+##
+## On EKS, GKE and AKS, nodes are replaced by upgrades and autoscaling, so a one-off run is
+## lost. This usually belongs in node bootstrap (launch template user data, startup script,
+## custom node image) or in a privileged DaemonSet that mounts the host filesystem.
+set -eu
+
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ca="$here/netskope-ca.crt"
+certs_d=/etc/containerd/certs.d
+[ -f "$ca" ] || { echo "Error: netskope-ca.crt not found next to this script" >&2; exit 1; }
+[ "$(uname -s)" = Linux ] || { echo "Error: Linux nodes only" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || { echo "Error: run this with sudo" >&2; exit 1; }
+
+# Copy $1 over $2 unless $2 already has identical content. Returns 1 when nothing changed.
+install_if_changed() {
+  if [ -f "$2" ] && cmp -s "$1" "$2"; then
+    return 1
+  fi
+  cp "$1" "$2" || exit 1
+  chmod 644 "$2" || exit 1
+}
+
+if [ "$#" -gt 0 ]; then
+  for reg in "$@"; do
+    case "$reg" in
+      ''|.*|*[!A-Za-z0-9._:-]*) echo "Error: invalid registry name '$reg'" >&2; exit 1 ;;
+    esac
+    dir="$certs_d/$reg"
+    mkdir -p "$dir"
+    changed=no
+    if install_if_changed "$ca" "$dir/ca.crt"; then changed=yes; fi
+    tmp=$(mktemp)
+    printf 'server = "https://%s"\\nca = "%s/ca.crt"\\n' "$reg" "$dir" > "$tmp"
+    if install_if_changed "$tmp" "$dir/hosts.toml"; then changed=yes; fi
+    rm -f "$tmp"
+    if [ "$changed" = yes ]; then
+      echo "[ok]   $reg: $dir/hosts.toml"
+    else
+      echo "[ok]   $reg: already configured"
+    fi
+  done
+
+  if grep -qs "^[[:space:]]*config_path[[:space:]]*=[[:space:]]*\\"$certs_d/*\\"" /etc/containerd/config.toml; then
+    echo "Takes effect on the next pull - no containerd restart needed."
+  else
+    echo "[warn] These files only work if containerd's registry config_path points at $certs_d,"
+    echo "       and /etc/containerd/config.toml does not set it. Add one of these (the table"
+    echo "       depends on your containerd version) and restart containerd once:"
+    echo "         containerd 1.x: [plugins.\\"io.containerd.grpc.v1.cri\\".registry]"
+    echo "         containerd 2.x: [plugins.\\"io.containerd.cri.v1.images\\".registry]"
+    echo "           config_path = \\"$certs_d\\""
+  fi
+  exit 0
+fi
+
+if [ -d /usr/local/share/ca-certificates ]; then
+  dir=/usr/local/share/ca-certificates; update='update-ca-certificates'
+elif [ -d /etc/pki/ca-trust/source/anchors ]; then
+  dir=/etc/pki/ca-trust/source/anchors; update='update-ca-trust extract'
+elif [ -d /etc/pki/trust/anchors ]; then
+  dir=/etc/pki/trust/anchors; update='update-ca-certificates'
+else
+  echo "Error: no CA trust directory found on this node" >&2
+  exit 1
+fi
+
+if ! install_if_changed "$ca" "$dir/netskope-ca.crt"; then
+  echo "[ok]   Netskope CA already installed in $dir - nothing to do (containerd not restarted)"
+  exit 0
+fi
+$update
+echo "[ok]   Netskope CA installed in $dir"
+
+if command -v systemctl >/dev/null 2>&1 && systemctl restart containerd; then
+  echo "[ok]   containerd restarted"
+else
+  echo "[warn] Could not restart containerd - restart it yourself to pick up the new CA" >&2
+  echo "       (k3s and RKE2 embed containerd: restart the k3s / rke2 service instead)" >&2
+fi
+"""
+
+K8S_REGENERATE_SH = """\
+#!/bin/sh
+## Rebuilds the files in this directory from the existing bundle, without prompting for the
+## tenant or API token (@@SCRIPT@@ --non-interactive). That also re-applies the
+## tool configuration, which is idempotent. Extra options are passed through, e.g.
+##   ./regenerate.sh --k8s-namespace other-namespace
+set -eu
+
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+parent=$(dirname -- "$here")
+script="$parent/@@SCRIPT@@"
+[ -f "$script" ] || { echo "Error: $script not found - keep this directory next to the bundle" >&2; exit 1; }
+exec python3 "$script" --k8s --non-interactive --cert-dir "$parent" --cert-name '@@BUNDLE@@' --k8s-namespace '@@NAMESPACE@@' "$@"
+"""
+
+K8S_REGENERATE_BAT = """\
+@echo off
+:: Rebuilds the files in this directory from the existing bundle, without prompting for the
+:: tenant or API token (@@SCRIPT@@ --non-interactive). That also re-applies the
+:: tool configuration, which is idempotent. Extra options are passed through, e.g.
+::   regenerate.bat --k8s-namespace other-namespace
+setlocal
+for %%I in ("%~dp0..") do set "PARENT=%%~fI"
+set "SCRIPT=%PARENT%\\@@SCRIPT@@"
+if not exist "%SCRIPT%" echo Error: %SCRIPT% not found - keep this directory next to the bundle & exit /b 1
+"@@PYTHON@@" "%SCRIPT%" --k8s --non-interactive --cert-dir "%PARENT%" --cert-name "@@BUNDLE@@" --k8s-namespace "@@NAMESPACE@@" %*
+exit /b %ERRORLEVEL%
+"""
+
+
+def k8s_render(template):
+    """Fill in the namespace and bundle name of a template."""
+    return template.replace("@@NAMESPACE@@", k8s_namespace).replace("@@BUNDLE@@", bundle_path.name)
+
+
+def k8s_yaml_block(path):
+    """Indent a PEM file for embedding as a YAML block scalar: CRs dropped, trailing blank
+    lines dropped, four-space indent, empty lines left empty."""
+    lines = path.read_bytes().decode("ascii").replace("\r", "").split("\n")
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "".join(("    " + line if line else "") + "\n" for line in lines)
+
+
+def write_k8s_assets():
+    """Write <cert dir>/k8s/. Returns False when the assets had to be skipped."""
+    name = bundle_path.name
+    # The bundle name becomes a ConfigMap key and appears in file paths inside pods.
+    if not re.fullmatch(r"[-._a-zA-Z0-9]+", name) or name == "netskope-ca.crt":
+        print(f"  Warning: bundle name '{name}' cannot be used as a ConfigMap key (letters, digits, "
+              "'-', '_' and '.' only, and not netskope-ca.crt) - skipping Kubernetes assets")
+        return False
+
+    # The CA that goes *into* the cluster. Prefer the Netskope-only chain; fall back to the full
+    # bundle when the user reused a bundle built before this split existed.
+    ca_source = netskope_ca_path
+    if not (netskope_ca_path.exists() and netskope_ca_path.stat().st_size):
+        ca_source = bundle_path
+        print("  Warning: netskope-ca.crt not found — using the full bundle (includes Mozilla roots).")
+        print("           Recreate the bundle to get a Netskope-only netskope-ca.crt.")
+    # These assets promise ASCII, so refuse anything but printable ASCII and whitespace.
+    for source in (bundle_path, ca_source):
+        if re.search(rb"[^\x09-\x0d\x20-\x7e]", source.read_bytes()):
+            print(f"  Warning: {source} contains non-ASCII bytes - skipping Kubernetes assets")
+            return False
+
+    k8s_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(ca_source, k8s_dir / "netskope-ca.crt")
+
+    # A ConfigMap is limited to 1 MiB (the two keys together).
+    total = bundle_path.stat().st_size + (k8s_dir / "netskope-ca.crt").stat().st_size
+    if total > 1000000:
+        print(f"  Warning: the ConfigMap data is {total} bytes; Kubernetes rejects ConfigMaps over 1 MiB")
+
+    ca_block = k8s_yaml_block(k8s_dir / "netskope-ca.crt")
+    write_asset(k8s_dir / "configmap.yaml",
+                k8s_render(K8S_CONFIGMAP_HEAD) + f"  {name}: |\n" + k8s_yaml_block(bundle_path)
+                + "  netskope-ca.crt: |\n" + ca_block)
+    write_asset(k8s_dir / "deployment-example.yaml", k8s_render(K8S_DEPLOYMENT))
+    write_asset(k8s_dir / "trust-manager-bundle.yaml",
+                k8s_render(K8S_TRUST_MANAGER_HEAD) + "  netskope-ca.crt: |\n" + ca_block
+                + k8s_render(K8S_TRUST_MANAGER_TAIL))
+    write_asset(k8s_dir / "README.md", k8s_render(K8S_README))
+    write_asset(k8s_dir / "trust-netskope-ca-on-node.sh", k8s_render(K8S_NODE_SH), executable=True)
+
+    # Rebuilding later without prompts (for example after the CA rotates): copy this script next
+    # to the bundle and write a wrapper that runs it with --non-interactive.
+    script = globals().get("__file__")
+    if not script:
+        print("  Warning: could not locate this script to copy next to the bundle - "
+              "regenerate script not written")
+        return True
+    script = Path(script).resolve()
+    script_copy = bundle_path.parent / script.name
+    if not (script_copy.exists() and script_copy.samefile(script)):
+        shutil.copy2(script, script_copy)
+    if IS_WINDOWS:
+        wrapper = K8S_REGENERATE_BAT.replace("@@SCRIPT@@", script.name).replace("@@PYTHON@@", sys.executable)
+        # A .bat is read by cmd.exe, so unlike the other assets it gets CRLF endings.
+        with open(k8s_dir / "regenerate.bat", "w", newline="\r\n") as f:
+            f.write(k8s_render(wrapper))
     else:
-        print("Running containers:")
-        for c in containers:
-            print(f"  {c}")
-        if input("Install the Netskope CA into these running containers now? (y/N) ").strip().lower() == "y":
-            for c in containers:
-                install_ca_in_container(c, docker_dir / "netskope-ca.crt")
-            print("Note: container changes are lost on recreate — bake the CA in via Dockerfile.snippet")
-        else:
-            print("Running containers left unchanged")
-
-    injector = "install-netskope-ca-in-container.ps1" if IS_WINDOWS else "install-netskope-ca-in-container.sh"
-    comment = "::" if IS_WINDOWS else "#"
-    append_tools_file(f"{comment} Netskope Docker assets: {docker_dir} (see its README.md)")
-    append_tools_file(f"{comment} Patch running containers: {docker_dir / injector}")
-
-
-# --- Azure Storage Explorer ---
-print()
-if IS_MAC:
-    se_dir = HOME / "Library/Application Support/StorageExplorer/certs"
-elif IS_LINUX:
-    se_dir = HOME / ".config/StorageExplorer/certs"
-else:
-    local_appdata = Path(os.environ.get("LOCALAPPDATA", ""))
-    se_dir = local_appdata / "Programs/Microsoft Azure Storage Explorer/certs"
-
-if se_dir.is_dir():
-    print("Azure Storage Explorer is installed")
-    target = se_dir / cert_name
-    if target.exists() and target.read_bytes() == bundle_path.read_bytes():
-        print("Azure Storage Explorer already configured with current certificate")
-    else:
-        shutil.copy2(bundle_path, se_dir)
-        print("Azure Storage Explorer configured")
-        if IS_WINDOWS:
-            append_tools_file(f'copy /y "{bundle_path}" "{se_dir}\\"')
-        else:
-            append_tools_file(f'cp "{bundle_path}" "{se_dir}/"')
-else:
-    print("Azure Storage Explorer is not installed")
+        write_asset(k8s_dir / "regenerate.sh",
+                    k8s_render(K8S_REGENERATE_SH.replace("@@SCRIPT@@", script.name)), executable=True)
+    return True
 
 
 # --- Claude Desktop ---
@@ -876,44 +1122,6 @@ def patch_vscode_settings(path, env_key):
     return "configured", had_comments
 
 
-print()
-if IS_MAC:
-    claude_config = HOME / "Library/Application Support/Claude/claude_desktop_config.json"
-    claude_installed = Path("/Applications/Claude.app").is_dir()
-elif IS_LINUX:
-    claude_config = HOME / ".config/Claude/claude_desktop_config.json"
-    claude_installed = (
-        command_exists("claude-desktop")
-        or Path("/usr/bin/claude-desktop").is_file()
-        or Path("/opt/Claude/claude-desktop").is_file()
-    )
-else:
-    appdata = Path(os.environ.get("APPDATA", ""))
-    local_appdata = Path(os.environ.get("LOCALAPPDATA", ""))
-    program_files = Path(os.environ.get("ProgramFiles", ""))
-    claude_config = appdata / "Claude/claude_desktop_config.json"
-    claude_installed = any(
-        p.exists() for p in (
-            local_appdata / "Programs/claude-desktop/Claude.exe",
-            program_files / "Claude/Claude.exe",
-            local_appdata / "Claude/Claude.exe",
-        )
-    )
-
-# Detect-only: `env` at the top level of claude_desktop_config.json is not a recognized
-# field (per-server env lives under mcpServers.<name>.env). Claude Desktop is Electron
-# and reads NODE_EXTRA_CA_CERTS from the user environment at launch — covered by setx
-# on Windows and by shell-rc exports for terminal-launched apps elsewhere.
-if claude_installed:
-    print("Claude Desktop is installed")
-    if IS_MAC:
-        print("Note: macOS GUI apps do not inherit shell env vars. If needed, run:")
-        print(f'      launchctl setenv NODE_EXTRA_CA_CERTS "{bundle_path}"')
-    print("      then restart Claude Desktop.")
-else:
-    print("Claude Desktop is not installed")
-
-
 # --- VS Code variants ---
 VSCODE_ENV_KEY = {
     "Darwin": "terminal.integrated.env.osx",
@@ -949,27 +1157,336 @@ def configure_vscode_variant(name, settings_file):
     print(f"Note: Please restart {name} for changes to take effect")
 
 
-if IS_MAC:
-    vscode_root = HOME / "Library/Application Support"
-elif IS_LINUX:
-    vscode_root = HOME / ".config"
-else:
-    vscode_root = Path(os.environ.get("APPDATA", ""))
-
-configure_vscode_variant("VS Code", vscode_root / "Code/User/settings.json")
-configure_vscode_variant("VS Code Insiders", vscode_root / "Code - Insiders/User/settings.json")
-configure_vscode_variant("Cursor", vscode_root / "Cursor/User/settings.json")
+def valid_k8s_namespace(name):
+    """A Kubernetes DNS-1123 label. The namespace ends up in YAML, so hold it to one."""
+    return len(name) <= 63 and re.fullmatch(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?", name) is not None
 
 
-# --- Final summary ---
-print()
-print("Configuration complete!")
-if SHELL_CONFIG:
-    print(f"Please restart your terminal or run: source {SHELL_CONFIG}")
-else:
-    print("Note: setx changes take effect in NEW console windows (not this one).")
-print()
-if IS_WINDOWS:
-    print(f'For silent deployment on other machines, run: "{configured_tools_file}"')
-else:
-    print(f"For silent deployment on other machines, run: source {configured_tools_file}")
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Configure CLI tools and apps to trust a Netskope SSL-inspection CA bundle. "
+                    "With no options the script asks for everything it needs.",
+        allow_abbrev=False,
+    )
+    parser.add_argument("--k8s", action="store_true",
+                        help="also write Kubernetes CA assets to <cert dir>/k8s/")
+    parser.add_argument("--k8s-namespace", metavar="NAME", default=None,
+                        help="namespace used in the Kubernetes manifests (default: default)")
+    parser.add_argument("--cert-dir", metavar="DIR", help="bundle directory (skips that prompt)")
+    parser.add_argument("--cert-name", metavar="NAME", help="bundle filename (skips that prompt)")
+    parser.add_argument("--non-interactive", action="store_true",
+                        help="never prompt: reuse the existing bundle in --cert-dir/--cert-name, so "
+                             "no tenant name or API token is needed. The tool configuration is "
+                             "re-applied (it is idempotent) and the existing configured_tools "
+                             "script is left as it is. Fails if the bundle does not exist yet.")
+    args = parser.parse_args()
+    args.k8s_namespace_set = args.k8s_namespace is not None
+    if not args.k8s_namespace_set:
+        args.k8s_namespace = "default"
+    elif not valid_k8s_namespace(args.k8s_namespace):
+        parser.error(f"invalid --k8s-namespace {args.k8s_namespace!r} "
+                     "(lowercase letters, digits and '-', at most 63 characters)")
+    return args
+
+
+def main():
+    global NETSKOPE_CERT_API, SHELL_CONFIG, bundle_path, configured_tools_file, netskope_ca_path
+    global docker_dir, k8s_dir, k8s_namespace, use_local_certs, api_token
+
+    args = parse_args()
+    SHELL_CONFIG = detect_shell_config()  # prints which shell was detected, so not at import time
+
+    # --- Interactive prompts ---
+
+    # --non-interactive reuses an existing bundle instead of building one, so there is nothing
+    # to fetch and no tenant is needed.
+    tenant_name = ""
+    if not args.non_interactive:
+        tenant_name = input(
+            "Please provide full Netskope tenant name (ex: tenant-name.goskope.com): "
+        ).strip()
+        if not tenant_name:
+            die("Tenant name cannot be empty")
+        if not re.fullmatch(r"[a-zA-Z0-9.-]+", tenant_name):
+            die("Invalid tenant name format")
+
+    NETSKOPE_CERT_API = f"https://{tenant_name}{NETSKOPE_CERT_API_PATH}"
+
+    # --cert-name / --cert-dir (and --non-interactive) replace the matching prompt
+    if args.cert_name or args.non_interactive:
+        cert_name = args.cert_name or "netskope-cert-bundle.pem"
+    else:
+        cert_name = prompt("Please provide certificate bundle name", "netskope-cert-bundle.pem")
+    default_dir = r"C:\netskope" if IS_WINDOWS else "~/netskope"
+    if args.cert_dir or args.non_interactive:
+        cert_dir = Path(os.path.expanduser(args.cert_dir or default_dir))
+    else:
+        cert_dir = Path(os.path.expanduser(prompt("Please provide certificate bundle location", default_dir)))
+    if args.non_interactive and not (cert_dir / cert_name).exists():
+        die(f"--non-interactive reuses an existing bundle, but {cert_dir / cert_name} does not exist\n"
+            "       Run the script once interactively to build it.")
+    cert_dir.mkdir(parents=True, exist_ok=True)
+
+    bundle_path = cert_dir / cert_name
+    configured_tools_file = cert_dir / ("configured_tools.bat" if IS_WINDOWS else "configured_tools.sh")
+
+    # Netskope-only certs, split out of the full bundle. Container trust stores already ship the
+    # Mozilla roots, so what they need is just the Netskope CA chain — and OS trust-store tools
+    # (update-ca-certificates / update-ca-trust) only pick up files with a .crt extension.
+    netskope_ca_path = cert_dir / "netskope-ca.crt"
+    docker_dir = cert_dir / "docker"
+    k8s_dir = cert_dir / "k8s"
+
+    # --- Local client cert detection ---
+    use_local_certs = False
+    if NS_CA_CERT and NS_CA_CERT.exists() and NS_TENANT_CERT.exists() and not args.non_interactive:
+        print("\nNetskope client is installed. Found local certificates:")
+        if shutil.which("openssl"):
+            for label, path in (("CA Certificate (nscacert.pem)", NS_CA_CERT),
+                                ("Tenant Certificate (nstenantcert.pem)", NS_TENANT_CERT)):
+                try:
+                    subj = subprocess.check_output(
+                        ["openssl", "x509", "-in", str(path), "-noout", "-subject"],
+                        text=True,
+                    ).strip()
+                    print(f"  {label}: {subj}")
+                except (subprocess.CalledProcessError, OSError):
+                    pass
+        if input("Use these local certificates instead of the API? (Y/n) ").strip().lower() != "n":
+            use_local_certs = True
+
+    # --- API token ---
+    api_token = ""
+    if not use_local_certs and not args.non_interactive:
+        env_token = os.environ.get("NETSKOPE_API_TOKEN", "")
+        if env_token:
+            print("\nFound NETSKOPE_API_TOKEN environment variable.")
+            print(f"Token: {env_token[:8]}...")
+            if input("Use this token? (Y/n) ").strip().lower() != "n":
+                api_token = env_token
+        if not api_token:
+            api_token = getpass("Please provide the Netskope API Bearer token: ").strip()
+            if not api_token:
+                die("API token cannot be empty")
+
+    if bundle_path.exists():
+        print(f"{cert_name} already exists in {cert_dir}.")
+        if not args.non_interactive and input("Recreate Certificate Bundle? (y/N) ").strip().lower() == "y":
+            build_bundle()
+    else:
+        build_bundle()
+
+    # --- Silent-deployment script initialization ---
+    replay_file = configured_tools_file
+    if args.non_interactive and replay_file.exists():
+        # A replay re-applies the configuration but must not rewrite the replay script: re-runs
+        # skip exports that are already set in the current shell, so a fresh file would lose
+        # those lines. Record into a scratch file instead and leave the existing script as it is.
+        scratch = tempfile.NamedTemporaryFile(prefix="configured_tools_", delete=False)
+        scratch.close()
+        atexit.register(os.unlink, scratch.name)
+        configured_tools_file = Path(scratch.name)
+    if IS_WINDOWS:
+        configured_tools_file.write_text(
+            "@echo off\n:: Silent deployment for configured tools\n"
+        )
+    else:
+        configured_tools_file.write_text(
+            "#!/bin/bash\n# Silent deployment for configured tools — source this file to apply exports.\n"
+        )
+        os.chmod(configured_tools_file, 0o755)
+
+    bundle_arg = str(bundle_path)
+
+    # Git: Windows uses `git config`; Unix uses GIT_SSL_CAINFO (matches shell scripts).
+    if IS_WINDOWS:
+        configure_tool("Git", None, "git", f'git config --global http.sslCAInfo "{bundle_arg}"')
+    else:
+        configure_tool("Git", "GIT_SSL_CAINFO", "git")
+    configure_tool("OpenSSL", "SSL_CERT_FILE", "openssl")
+    configure_tool("cURL", "CURL_CA_BUNDLE", "curl")
+    configure_tool("Python Requests Library", "REQUESTS_CA_BUNDLE", "python3")
+    configure_tool("AWS CLI", "AWS_CA_BUNDLE", "aws")
+    configure_tool("Google Cloud CLI", None, "gcloud",
+                   f'gcloud config set core/custom_ca_certs_file "{bundle_arg}"')
+    configure_tool("NodeJS Package Manager (NPM)", None, "npm",
+                   f'npm config set cafile "{bundle_arg}"')
+    configure_tool("NodeJS", "NODE_EXTRA_CA_CERTS", "node")
+    # Ruby honors SSL_CERT_FILE (already set by OpenSSL entry — no-op on re-run)
+    configure_tool("Ruby", "SSL_CERT_FILE", "ruby")
+    configure_tool("PHP Composer", None, "composer",
+                   f'composer config --global cafile "{bundle_arg}"')
+    # Azure CLI honors REQUESTS_CA_BUNDLE (same var as Python Requests — safe no-op)
+    configure_tool("Azure CLI", "REQUESTS_CA_BUNDLE", "az")
+    configure_tool("Python PIP", "PIP_CERT", "pip3")
+    configure_tool("Oracle Cloud CLI", "OCI_CLI_CA_BUNDLE", "oci")
+    configure_tool("Cargo Package Manager", "CARGO_HTTP_CAINFO", "cargo")
+    configure_tool("Yarn", None, "yarnpkg",
+                   f'yarnpkg config set httpsCaFilePath "{bundle_arg}"')
+    configure_tool("Claude CLI", "NODE_EXTRA_CA_CERTS", "claude")
+
+    # Netskope CLI (ntsk) — set ALL of these. Empirically, ntsk hits raw ssl/urllib
+    # code paths that only honor SSL_CERT_FILE, even though its docs imply
+    # NETSKOPE_CA_BUNDLE is enough. On a host without openssl/curl/python on PATH,
+    # none of those vars get set elsewhere and ntsk fails with TLS errors.
+    print()
+    if not command_exists("ntsk"):
+        print("Netskope CLI is not installed")
+    else:
+        print("Netskope CLI is installed")
+        cert_path = str(bundle_path)
+        for v in ("NETSKOPE_CA_BUNDLE", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
+            if os.environ.get(v) == cert_path:
+                print(f"  {v} already set in current shell")
+            else:
+                set_env_var(v, cert_path)
+                print(f"  {v} configured")
+
+    print()
+    if not command_exists("docker"):
+        print("Docker is not installed")
+    else:
+        print("Docker is installed")
+        write_docker_assets()
+        print(f"Docker build assets written: {docker_dir}")
+
+        containers = running_containers()
+        if not containers:
+            print("No running containers to patch (or the Docker daemon is not reachable)")
+        elif args.non_interactive:
+            print("Running containers left unchanged (non-interactive)")
+        else:
+            print("Running containers:")
+            for c in containers:
+                print(f"  {c}")
+            if input("Install the Netskope CA into these running containers now? (y/N) ").strip().lower() == "y":
+                for c in containers:
+                    install_ca_in_container(c, docker_dir / "netskope-ca.crt")
+                print("Note: container changes are lost on recreate — bake the CA in via Dockerfile.snippet")
+            else:
+                print("Running containers left unchanged")
+
+        injector = "install-netskope-ca-in-container.ps1" if IS_WINDOWS else "install-netskope-ca-in-container.sh"
+        comment = "::" if IS_WINDOWS else "#"
+        append_tools_file(f"{comment} Netskope Docker assets: {docker_dir} (see its README.md)")
+        append_tools_file(f"{comment} Patch running containers: {docker_dir / injector}")
+
+    # --- Kubernetes ---
+    k8s_failed = False
+    k8s_namespace = args.k8s_namespace
+    # Say nothing unless Kubernetes was asked for or kubectl suggests the offer, so a run
+    # without --k8s on a machine without kubectl prints exactly what it always did.
+    if args.k8s or command_exists("kubectl"):
+        print()
+        if not args.k8s and not args.non_interactive:
+            print("kubectl is installed")
+            if input(f"Generate Kubernetes CA assets in {k8s_dir}? (y/N) ").strip().lower() == "y":
+                args.k8s = True
+                if not args.k8s_namespace_set:
+                    k8s_namespace = prompt("Kubernetes namespace", k8s_namespace)
+                    if not valid_k8s_namespace(k8s_namespace):
+                        die(f"invalid namespace {k8s_namespace!r} (lowercase letters, digits and '-', "
+                            "at most 63 characters)")
+        if args.k8s:
+            if write_k8s_assets():
+                print(f"Kubernetes assets written: {k8s_dir} (namespace: {k8s_namespace})")
+            else:
+                k8s_failed = True
+        else:
+            print("Kubernetes assets not generated (pass --k8s to generate them)")
+
+
+    # --- Azure Storage Explorer ---
+    print()
+    if IS_MAC:
+        se_dir = HOME / "Library/Application Support/StorageExplorer/certs"
+    elif IS_LINUX:
+        se_dir = HOME / ".config/StorageExplorer/certs"
+    else:
+        local_appdata = Path(os.environ.get("LOCALAPPDATA", ""))
+        se_dir = local_appdata / "Programs/Microsoft Azure Storage Explorer/certs"
+
+    if se_dir.is_dir():
+        print("Azure Storage Explorer is installed")
+        target = se_dir / cert_name
+        if target.exists() and target.read_bytes() == bundle_path.read_bytes():
+            print("Azure Storage Explorer already configured with current certificate")
+        else:
+            shutil.copy2(bundle_path, se_dir)
+            print("Azure Storage Explorer configured")
+            if IS_WINDOWS:
+                append_tools_file(f'copy /y "{bundle_path}" "{se_dir}\\"')
+            else:
+                append_tools_file(f'cp "{bundle_path}" "{se_dir}/"')
+    else:
+        print("Azure Storage Explorer is not installed")
+
+    # --- Claude Desktop ---
+    print()
+    if IS_MAC:
+        claude_config = HOME / "Library/Application Support/Claude/claude_desktop_config.json"
+        claude_installed = Path("/Applications/Claude.app").is_dir()
+    elif IS_LINUX:
+        claude_config = HOME / ".config/Claude/claude_desktop_config.json"
+        claude_installed = (
+            command_exists("claude-desktop")
+            or Path("/usr/bin/claude-desktop").is_file()
+            or Path("/opt/Claude/claude-desktop").is_file()
+        )
+    else:
+        appdata = Path(os.environ.get("APPDATA", ""))
+        local_appdata = Path(os.environ.get("LOCALAPPDATA", ""))
+        program_files = Path(os.environ.get("ProgramFiles", ""))
+        claude_config = appdata / "Claude/claude_desktop_config.json"
+        claude_installed = any(
+            p.exists() for p in (
+                local_appdata / "Programs/claude-desktop/Claude.exe",
+                program_files / "Claude/Claude.exe",
+                local_appdata / "Claude/Claude.exe",
+            )
+        )
+
+    # Detect-only: `env` at the top level of claude_desktop_config.json is not a recognized
+    # field (per-server env lives under mcpServers.<name>.env). Claude Desktop is Electron
+    # and reads NODE_EXTRA_CA_CERTS from the user environment at launch — covered by setx
+    # on Windows and by shell-rc exports for terminal-launched apps elsewhere.
+    if claude_installed:
+        print("Claude Desktop is installed")
+        if IS_MAC:
+            print("Note: macOS GUI apps do not inherit shell env vars. If needed, run:")
+            print(f'      launchctl setenv NODE_EXTRA_CA_CERTS "{bundle_path}"')
+        print("      then restart Claude Desktop.")
+    else:
+        print("Claude Desktop is not installed")
+
+    if IS_MAC:
+        vscode_root = HOME / "Library/Application Support"
+    elif IS_LINUX:
+        vscode_root = HOME / ".config"
+    else:
+        vscode_root = Path(os.environ.get("APPDATA", ""))
+
+    configure_vscode_variant("VS Code", vscode_root / "Code/User/settings.json")
+    configure_vscode_variant("VS Code Insiders", vscode_root / "Code - Insiders/User/settings.json")
+    configure_vscode_variant("Cursor", vscode_root / "Cursor/User/settings.json")
+
+
+    # --- Final summary ---
+    print()
+    print("Configuration complete!")
+    if SHELL_CONFIG:
+        print(f"Please restart your terminal or run: source {SHELL_CONFIG}")
+    else:
+        print("Note: setx changes take effect in NEW console windows (not this one).")
+    print()
+    if IS_WINDOWS:
+        print(f'For silent deployment on other machines, run: "{replay_file}"')
+    else:
+        print(f"For silent deployment on other machines, run: source {replay_file}")
+
+    if k8s_failed:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

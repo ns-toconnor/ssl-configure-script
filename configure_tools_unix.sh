@@ -35,6 +35,63 @@ MOZILLA_BUNDLE_URL="https://curl.se/ca/cacert.pem"
 # not the real bundle. Guards against silently writing junk into the trust store.
 MOZILLA_MIN_BYTES=50000
 
+# --- Command-line options ---
+# With no options the script is fully interactive, exactly as before. --cert-dir / --cert-name
+# pre-answer the matching prompt; --non-interactive and --k8s are described in usage().
+K8S=false
+K8S_NAMESPACE=default
+K8S_NAMESPACE_SET=false
+CERT_DIR_ARG=""
+CERT_NAME_ARG=""
+NON_INTERACTIVE=false
+
+usage() {
+  cat <<'USAGE'
+Usage: configure_tools_unix.sh [options]
+
+With no options the script asks for everything it needs.
+
+  --k8s                 Also write Kubernetes CA assets to <certDir>/k8s/
+  --k8s-namespace NAME  Namespace used in the Kubernetes manifests (default: default)
+  --cert-dir DIR        Bundle directory (skips that prompt)
+  --cert-name NAME      Bundle filename (skips that prompt)
+  --non-interactive     Never prompt. Reuses the existing bundle in --cert-dir/--cert-name,
+                        so no tenant name or API token is needed. The tool configuration is
+                        re-applied (it is idempotent) and configured_tools.sh is left as it
+                        is. Fails if the bundle does not exist yet.
+  -h, --help            Show this help
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --k8s)             K8S=true; shift ;;
+    --non-interactive) NON_INTERACTIVE=true; shift ;;
+    -h|--help)         usage; exit 0 ;;
+    --k8s-namespace|--cert-dir|--cert-name)
+      [[ $# -ge 2 ]] || { echo "Error: $1 requires a value" >&2; exit 2; }
+      case "$1" in
+        --k8s-namespace) K8S_NAMESPACE=$2; K8S_NAMESPACE_SET=true ;;
+        --cert-dir)      CERT_DIR_ARG=$2 ;;
+        --cert-name)     CERT_NAME_ARG=$2 ;;
+      esac
+      shift 2 ;;
+    --k8s-namespace=*) K8S_NAMESPACE=${1#*=}; K8S_NAMESPACE_SET=true; shift ;;
+    --cert-dir=*)      CERT_DIR_ARG=${1#*=}; shift ;;
+    --cert-name=*)     CERT_NAME_ARG=${1#*=}; shift ;;
+    *) echo "Error: unknown option '$1'" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+# The namespace ends up in YAML, so hold it to a Kubernetes DNS-1123 label.
+valid_k8s_namespace() {
+  [[ "$1" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ && ${#1} -le 63 ]]
+}
+if ! valid_k8s_namespace "$K8S_NAMESPACE"; then
+  echo "Error: invalid --k8s-namespace '$K8S_NAMESPACE' (lowercase letters, digits and '-', at most 63 characters)" >&2
+  exit 2
+fi
+
 # Require python3 up front — used for API response parsing and JSON config edits
 if ! command -v python3 >/dev/null 2>&1; then
   echo "Error: python3 is required"
@@ -97,29 +154,48 @@ else
   VSCODE_ENV_KEY="terminal.integrated.env.linux"
 fi
 
-# Get Netskope tenant name
-read -p "Please provide full Netskope tenant name (ex: tenant-name.goskope.com): " tenantName
-if [[ -z "$tenantName" ]]; then
-  echo "Error: Tenant name cannot be empty"
-  exit 1
-fi
+# Get Netskope tenant name. --non-interactive reuses an existing bundle instead of building
+# one, so there is nothing to fetch and no tenant is needed.
+if [[ "$NON_INTERACTIVE" == true ]]; then
+  tenantName=""
+else
+  read -p "Please provide full Netskope tenant name (ex: tenant-name.goskope.com): " tenantName
+  if [[ -z "$tenantName" ]]; then
+    echo "Error: Tenant name cannot be empty"
+    exit 1
+  fi
 
-# Validate tenant name format (basic check)
-if [[ ! "$tenantName" =~ ^[a-zA-Z0-9.-]+$ ]]; then
-  echo "Error: Invalid tenant name format"
-  exit 1
+  # Validate tenant name format (basic check)
+  if [[ ! "$tenantName" =~ ^[a-zA-Z0-9.-]+$ ]]; then
+    echo "Error: Invalid tenant name format"
+    exit 1
+  fi
 fi
 
 NETSKOPE_CERT_API="https://$tenantName$NETSKOPE_CERT_API_PATH"
 
-# Set Certificate bundle name and location
-read -p "Please provide certificate bundle name [netskope-cert-bundle.pem]: " certName
-certName=${certName:-netskope-cert-bundle.pem}
-read -p "Please provide certificate bundle location [~/netskope]: " certDir
-certDir=${certDir:-~/netskope}
+# Set Certificate bundle name and location (--cert-name / --cert-dir replace the prompts)
+if [[ -n "$CERT_NAME_ARG" || "$NON_INTERACTIVE" == true ]]; then
+  certName=${CERT_NAME_ARG:-netskope-cert-bundle.pem}
+else
+  read -p "Please provide certificate bundle name [netskope-cert-bundle.pem]: " certName
+  certName=${certName:-netskope-cert-bundle.pem}
+fi
+if [[ -n "$CERT_DIR_ARG" || "$NON_INTERACTIVE" == true ]]; then
+  certDir=${CERT_DIR_ARG:-~/netskope}
+else
+  read -p "Please provide certificate bundle location [~/netskope]: " certDir
+  certDir=${certDir:-~/netskope}
+fi
 
 # Expand tilde properly
 certDir="${certDir/#\~/$HOME}"
+
+if [[ "$NON_INTERACTIVE" == true && ! -f "$certDir/$certName" ]]; then
+  echo "Error: --non-interactive reuses an existing bundle, but $certDir/$certName does not exist" >&2
+  echo "       Run the script once interactively to build it." >&2
+  exit 1
+fi
 
 if [ ! -d "$certDir" ]; then
   echo "$certDir does not exist."
@@ -129,19 +205,28 @@ fi
 
 # Silent-deployment script lives alongside the bundle, not in CWD
 CONFIGURED_TOOLS_FILE="$certDir/configured_tools.sh"
+REPLAY_FILE="$CONFIGURED_TOOLS_FILE"
+if [[ "$NON_INTERACTIVE" == true && -f "$REPLAY_FILE" ]]; then
+  # A replay re-applies the configuration but must not rewrite the replay script: re-runs skip
+  # exports that are already set in the current shell, so a fresh file would lose those lines.
+  # Record into a scratch file instead and leave the existing replay script untouched.
+  CONFIGURED_TOOLS_FILE=$(mktemp)
+  register_temp "$CONFIGURED_TOOLS_FILE"
+fi
 
 # Netskope-only certs, split out of the full bundle. Container trust stores already ship the
 # Mozilla roots, so what they need is just the Netskope CA chain — and OS trust-store tools
 # (update-ca-certificates / update-ca-trust) only pick up files with a .crt extension.
 NETSKOPE_ONLY_CRT="$certDir/netskope-ca.crt"
 DOCKER_ASSET_DIR="$certDir/docker"
+K8S_ASSET_DIR="$certDir/k8s"
 
 # Check for local Netskope client certificates
 NS_CA_CERT="$NS_CLIENT_CERT_DIR/nscacert.pem"
 NS_TENANT_CERT="$NS_CLIENT_CERT_DIR/nstenantcert.pem"
 use_local_certs=false
 
-if [[ -f "$NS_CA_CERT" && -f "$NS_TENANT_CERT" ]]; then
+if [[ -f "$NS_CA_CERT" && -f "$NS_TENANT_CERT" && "$NON_INTERACTIVE" != true ]]; then
   say_section "Local Netskope client certificates detected"
   echo "  CA Certificate (nscacert.pem):"
   openssl x509 -in "$NS_CA_CERT" -noout -subject 2>/dev/null | sed 's/^/    /'
@@ -157,7 +242,7 @@ fi
 
 # Get API token for certificate retrieval (only needed if not using local certs)
 api_token=""
-if [[ "$use_local_certs" == false ]]; then
+if [[ "$use_local_certs" == false && "$NON_INTERACTIVE" != true ]]; then
   if [[ -n "${NETSKOPE_API_TOKEN:-}" ]]; then
     echo
     echo "Found NETSKOPE_API_TOKEN environment variable."
@@ -314,8 +399,12 @@ except (json.JSONDecodeError, KeyError) as e:
 
 if [ -f "$certDir/$certName" ]; then
   echo "$certName already exists in $certDir."
-  read -p "Recreate Certificate Bundle? (y/N) " -n 1 -r
-  echo
+  if [[ "$NON_INTERACTIVE" == true ]]; then
+    REPLY=n
+  else
+    read -p "Recreate Certificate Bundle? (y/N) " -n 1 -r
+    echo
+  fi
   if [[ $REPLY =~ ^[Yy]$ ]]; then
     create_cert_bundle
   else
@@ -724,7 +813,9 @@ if command_exists docker; then
 
   # `docker ps` fails when the daemon is not running (Docker Desktop stopped, no socket
   # permission); the assets above are still useful, so treat it as a soft skip.
-  if running_containers=$(docker ps --format '{{.Names}}' 2>/dev/null) && [[ -n "$running_containers" ]]; then
+  if [[ "$NON_INTERACTIVE" == true ]]; then
+    say_skip "Running containers left unchanged (non-interactive)"
+  elif running_containers=$(docker ps --format '{{.Names}}' 2>/dev/null) && [[ -n "$running_containers" ]]; then
     echo "  Running containers:"
     echo "$running_containers" | sed 's/^/    /'
     read -p "  Install the Netskope CA into these running containers now? (y/N) " -n 1 -r
@@ -745,6 +836,446 @@ if command_exists docker; then
   } >> "$CONFIGURED_TOOLS_FILE"
 else
   say_skip "Docker not installed"
+fi
+
+# Pods use their image's trust store, and nodes pull images with their own containerd, so
+# neither is reached by the host configuration above. Unlike the Docker assets these are
+# opt-in: pass --k8s, or answer y below when kubectl is installed.
+#
+# <certDir>/k8s/ gets a ConfigMap carrying the CA, an example Deployment that mounts it, an
+# optional trust-manager Bundle and a README. The full bundle is ~220 KB, so the ConfigMap
+# must not be applied client-side - see the comment at the top of configmap.yaml.
+
+# These assets promise ASCII, so refuse anything but printable ASCII and whitespace rather
+# than embed it.
+check_ascii() {
+  if LC_ALL=C grep -q '[^[:print:][:space:]]' "$1"; then
+    say_warn "$1 contains non-ASCII bytes - skipping Kubernetes assets"
+    return 1
+  fi
+}
+
+# Indent a PEM file for embedding as a YAML block scalar: CRs dropped, trailing blank lines
+# dropped, four-space indent, empty lines left empty.
+yaml_block() {
+  tr -d '\r' < "$1" | awk '
+    { line[NR] = $0 }
+    END {
+      n = NR
+      while (n > 0 && line[n] ~ /^[[:space:]]*$/) n--
+      for (i = 1; i <= n; i++) print (line[i] == "" ? "" : "    " line[i])
+    }'
+}
+
+# Fill in the namespace and bundle name of a template read from stdin.
+k8s_render() {
+  sed -e "s|@@NAMESPACE@@|$K8S_NAMESPACE|g" -e "s|@@BUNDLE@@|$certName|g"
+}
+
+write_k8s_assets() {
+  # $certName becomes a ConfigMap key and appears in file paths inside pods.
+  if [[ ! "$certName" =~ ^[-._a-zA-Z0-9]+$ || "$certName" == "netskope-ca.crt" ]]; then
+    say_warn "Bundle name '$certName' cannot be used as a ConfigMap key (letters, digits, '-', '_' and '.' only, and not netskope-ca.crt) - skipping Kubernetes assets"
+    return 1
+  fi
+
+  # The CA that goes *into* the cluster. Prefer the Netskope-only chain; fall back to the full
+  # bundle when the user reused an existing bundle built before this script wrote the split.
+  local ca_source="$NETSKOPE_ONLY_CRT"
+  if [[ ! -s "$NETSKOPE_ONLY_CRT" ]]; then
+    ca_source="$certDir/$certName"
+    say_warn "netskope-ca.crt not found — using the full bundle (includes Mozilla roots)"
+    echo "         Recreate the bundle to get a Netskope-only netskope-ca.crt."
+  fi
+  check_ascii "$certDir/$certName" || return 1
+  check_ascii "$ca_source" || return 1
+
+  mkdir -p "$K8S_ASSET_DIR"
+  cp "$ca_source" "$K8S_ASSET_DIR/netskope-ca.crt"
+  chmod 644 "$K8S_ASSET_DIR/netskope-ca.crt"
+
+  # A ConfigMap is limited to 1 MiB (the two keys together).
+  local total
+  total=$(( $(wc -c < "$certDir/$certName") + $(wc -c < "$K8S_ASSET_DIR/netskope-ca.crt") ))
+  if [[ "$total" -gt 1000000 ]]; then
+    say_warn "The ConfigMap data is $total bytes; Kubernetes rejects ConfigMaps over 1 MiB"
+  fi
+
+  {
+    k8s_render <<'EOF'
+# Netskope CA trust for Kubernetes workloads, generated by the ssl-configure scripts.
+#
+# Two keys, for two kinds of client:
+#   @@BUNDLE@@
+#       Netskope CA chain + Mozilla roots. For the variables that REPLACE a client's default
+#       store (REQUESTS_CA_BUNDLE, SSL_CERT_FILE, CURL_CA_BUNDLE, ...).
+#   netskope-ca.crt
+#       Netskope CA chain only. For NODE_EXTRA_CA_CERTS, which ADDS to Node's built-in CAs.
+#
+# NOTE: the full bundle is about 220 KB. Client-side "kubectl apply" stores the whole object in
+# the kubectl.kubernetes.io/last-applied-configuration annotation, which is limited to 262144
+# bytes, so it fails for this ConfigMap. Use one of:
+#   kubectl apply --server-side -f configmap.yaml
+#   kubectl create -f configmap.yaml        (kubectl replace -f configmap.yaml to update)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: netskope-ca
+  namespace: @@NAMESPACE@@
+data:
+EOF
+    printf '  %s: |\n' "$certName"
+    yaml_block "$certDir/$certName"
+    printf '  netskope-ca.crt: |\n'
+    yaml_block "$K8S_ASSET_DIR/netskope-ca.crt"
+  } > "$K8S_ASSET_DIR/configmap.yaml"
+
+  k8s_render > "$K8S_ASSET_DIR/deployment-example.yaml" <<'EOF'
+# Example Deployment that trusts the Netskope CA through the "netskope-ca" ConfigMap
+# (configmap.yaml). Apply the ConfigMap first, then adapt this to your own workload.
+#
+# The ConfigMap is mounted read-only at /etc/netskope. Do not mount it over /etc/ssl/certs, and
+# do not use subPath: subPath mounts never pick up ConfigMap updates.
+#
+# Java does not read any of these variables and needs its own truststore. .NET on Linux reads
+# only SSL_CERT_FILE and SSL_CERT_DIR. Other runtimes may need their own setup.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: netskope-ca-example
+  namespace: @@NAMESPACE@@
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: netskope-ca-example
+  template:
+    metadata:
+      labels:
+        app: netskope-ca-example
+    spec:
+      containers:
+        - name: app
+          image: ubuntu:24.04 # replace with your own image
+          command: ["sleep", "infinity"]
+          env:
+            # Adds to Node's built-in CAs, so the Netskope chain alone is enough.
+            - name: NODE_EXTRA_CA_CERTS
+              value: /etc/netskope/netskope-ca.crt
+            # These REPLACE the default store, so they must point at the full bundle, which
+            # includes the Mozilla roots.
+            - name: REQUESTS_CA_BUNDLE
+              value: /etc/netskope/@@BUNDLE@@
+            - name: PIP_CERT
+              value: /etc/netskope/@@BUNDLE@@
+            - name: SSL_CERT_FILE
+              value: /etc/netskope/@@BUNDLE@@
+            - name: CURL_CA_BUNDLE
+              value: /etc/netskope/@@BUNDLE@@
+            - name: GIT_SSL_CAINFO
+              value: /etc/netskope/@@BUNDLE@@
+            - name: CARGO_HTTP_CAINFO
+              value: /etc/netskope/@@BUNDLE@@
+            - name: AWS_CA_BUNDLE
+              value: /etc/netskope/@@BUNDLE@@
+          volumeMounts:
+            - name: netskope-ca
+              mountPath: /etc/netskope
+              readOnly: true
+      volumes:
+        - name: netskope-ca
+          configMap:
+            name: netskope-ca
+EOF
+
+  {
+    k8s_render <<'EOF'
+# Optional: only for clusters that run cert-manager's trust-manager
+# (https://cert-manager.io/docs/trust/trust-manager/). Use this INSTEAD of configmap.yaml, not
+# alongside it: both produce a ConfigMap named "netskope-ca".
+#
+# trust-manager reads the source ConfigMap below (it must live in trust-manager's trust
+# namespace, "cert-manager" by default) and writes one merged bundle, the default public CAs
+# plus the Netskope chain, into a ConfigMap named "netskope-ca" in every namespace labelled
+# netskope-ca=enabled:
+#   kubectl label namespace @@NAMESPACE@@ netskope-ca=enabled
+#
+# With this route the merged bundle already contains the Netskope chain, so EVERY variable in
+# deployment-example.yaml, including NODE_EXTRA_CA_CERTS, points at /etc/netskope/ca-bundle.pem.
+#
+# useDefaultCAs needs trust-manager's default CA package to be enabled. Unlike configmap.yaml
+# this file is small, so plain "kubectl apply -f trust-manager-bundle.yaml" works.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: netskope-ca-source
+  namespace: cert-manager
+data:
+EOF
+    printf '  netskope-ca.crt: |\n'
+    yaml_block "$K8S_ASSET_DIR/netskope-ca.crt"
+    k8s_render <<'EOF'
+---
+apiVersion: trust.cert-manager.io/v1alpha1
+kind: Bundle
+metadata:
+  name: netskope-ca
+spec:
+  sources:
+    - useDefaultCAs: true
+    - configMap:
+        name: netskope-ca-source
+        key: netskope-ca.crt
+  target:
+    configMap:
+      key: ca-bundle.pem
+    namespaceSelector:
+      matchLabels:
+        netskope-ca: enabled
+EOF
+  } > "$K8S_ASSET_DIR/trust-manager-bundle.yaml"
+
+  k8s_render > "$K8S_ASSET_DIR/README.md" <<'EOF'
+# Netskope certificates for Kubernetes
+
+Pods use the trust store of their own image, so the host configuration does not reach them.
+There is no Netskope Client on cluster nodes either, which is why these files carry the CA
+instead. Pick whichever of these matches how the cluster is run:
+
+| File | Use |
+| --- | --- |
+| `configmap.yaml` | ConfigMap `netskope-ca` holding the full bundle and the Netskope-only chain |
+| `deployment-example.yaml` | Example Deployment that mounts the ConfigMap and points the CA variables at it |
+| `trust-manager-bundle.yaml` | Optional: the same result through cert-manager's trust-manager |
+| `trust-netskope-ca-on-node.sh` | Make the node's containerd trust the CA (image pulls) |
+| `netskope-ca.crt` | The Netskope CA chain only - used by the node script |
+
+To rebuild these files from the existing bundle without any prompts, run `regenerate.sh` in
+this directory if there is one (macOS / Linux / Python), or `configured_tools.ps1 -K8s` on
+Windows PowerShell.
+
+## Two separate problems
+
+Pod trust and node trust fail independently, and fixing one does not fix the other:
+
+- **The pods** need the CA in the trust store, or the CA variables, of the workload itself.
+  That is what `configmap.yaml` and `deployment-example.yaml` provide. A pod without it fails
+  its own HTTPS calls.
+- **The nodes** pull images with the node's containerd, which does its own TLS to the
+  registry. A node without the CA leaves pods in `ErrImagePull` / `ImagePullBackOff` with
+  `x509: certificate signed by unknown authority` before any container exists.
+  `trust-netskope-ca-on-node.sh` (Linux, needs `sudo`) fixes this two ways: with no
+  arguments it installs into the node's OS trust store, which covers every registry but
+  restarts containerd; given registry names it writes
+  `/etc/containerd/certs.d/<registry>/hosts.toml`, which takes effect on the next pull with
+  no restart but only for those registries, and only if containerd's `config_path` points at
+  that directory. On EKS, GKE and AKS a manual run is lost when nodes are replaced, so put
+  it in node bootstrap or a privileged DaemonSet instead. k3s and RKE2 embed their own
+  containerd: restart the k3s / rke2 service rather than `containerd`.
+
+## Pods
+
+- **Baking beats mounting.** Putting the CA into the image (see `Dockerfile.snippet` in the
+  `docker/` directory) works wherever the image runs and needs no per-workload wiring.
+  Mount the ConfigMap for images you cannot rebuild.
+- **Apply the ConfigMap with `kubectl apply --server-side -f configmap.yaml` or
+  `kubectl create -f configmap.yaml`.** The full bundle is about 220 KB, and client-side
+  `kubectl apply` copies the whole object into the `last-applied-configuration` annotation,
+  which is limited to 262144 bytes.
+- **Mount it read-only at `/etc/netskope`.** Do not mount over `/etc/ssl/certs`, and do not
+  use `subPath`: subPath mounts never pick up ConfigMap updates.
+- **Pick the right file for each variable.** `NODE_EXTRA_CA_CERTS` adds to Node's built-in
+  CAs, so it takes `netskope-ca.crt`. `REQUESTS_CA_BUNDLE`, `PIP_CERT`, `SSL_CERT_FILE`,
+  `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`, `CARGO_HTTP_CAINFO` and `AWS_CA_BUNDLE` replace the
+  default store, so they must point at the full bundle, which includes the Mozilla roots.
+- **Java and .NET.** Java reads none of these variables and needs a truststore of its own.
+  .NET on Linux reads only `SSL_CERT_FILE` and `SSL_CERT_DIR`.
+
+## trust-manager
+
+If the cluster already runs cert-manager's trust-manager, `trust-manager-bundle.yaml` lets it
+build the merged bundle (default public CAs plus the Netskope chain) and publish it as a
+ConfigMap in every namespace labelled `netskope-ca=enabled`. Use it instead of
+`configmap.yaml`. The merged bundle already contains the Netskope chain, so every variable,
+including `NODE_EXTRA_CA_CERTS`, points at `/etc/netskope/ca-bundle.pem`.
+
+## Rotating the CA
+
+1. Re-run the script to rebuild the bundle.
+2. Re-apply the ConfigMap: `kubectl apply --server-side -f configmap.yaml` (with
+   trust-manager, re-apply `trust-manager-bundle.yaml`).
+3. Restart the workloads: `kubectl rollout restart deployment/<name> -n <namespace>`. Most
+   applications read their CAs once at startup, so a changed file is not enough.
+4. On nodes that trust the CA, re-run `trust-netskope-ca-on-node.sh`.
+
+## Verify
+
+```
+kubectl exec -n <namespace> deploy/netskope-ca-example -- sh -c 'ls -l /etc/netskope; env | grep -E "CA|CERT"'
+```
+EOF
+
+  k8s_render > "$K8S_ASSET_DIR/trust-netskope-ca-on-node.sh" <<'EOF'
+#!/bin/sh
+## Makes the node's containerd trust the Netskope CA, so image pulls succeed behind SSL
+## inspection. This is separate from the CA inside pods - the node does its own TLS to the
+## registry, so a pod can be set up correctly and still sit in ImagePullBackOff with
+## "x509: certificate signed by unknown authority". Linux nodes only; run with sudo. Safe to
+## re-run.
+##
+##   sudo ./trust-netskope-ca-on-node.sh
+##       Install into the node's OS trust store, which covers every registry. Restarts
+##       containerd, but only when the CA was added or changed.
+##
+##   sudo ./trust-netskope-ca-on-node.sh myreg.example.com:5000 ...
+##       Write /etc/containerd/certs.d/<registry>/hosts.toml (plus a copy of the CA) for each
+##       registry. Takes effect on the next pull with no restart, but only for the registries
+##       named, and ONLY if containerd's config_path points at /etc/containerd/certs.d (see
+##       the warning this mode prints). The directory name must match the registry exactly as
+##       it appears in the image reference, port included.
+##
+## On EKS, GKE and AKS, nodes are replaced by upgrades and autoscaling, so a one-off run is
+## lost. This usually belongs in node bootstrap (launch template user data, startup script,
+## custom node image) or in a privileged DaemonSet that mounts the host filesystem.
+set -eu
+
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ca="$here/netskope-ca.crt"
+certs_d=/etc/containerd/certs.d
+[ -f "$ca" ] || { echo "Error: netskope-ca.crt not found next to this script" >&2; exit 1; }
+[ "$(uname -s)" = Linux ] || { echo "Error: Linux nodes only" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || { echo "Error: run this with sudo" >&2; exit 1; }
+
+# Copy $1 over $2 unless $2 already has identical content. Returns 1 when nothing changed.
+install_if_changed() {
+  if [ -f "$2" ] && cmp -s "$1" "$2"; then
+    return 1
+  fi
+  cp "$1" "$2" || exit 1
+  chmod 644 "$2" || exit 1
+}
+
+if [ "$#" -gt 0 ]; then
+  for reg in "$@"; do
+    case "$reg" in
+      ''|.*|*[!A-Za-z0-9._:-]*) echo "Error: invalid registry name '$reg'" >&2; exit 1 ;;
+    esac
+    dir="$certs_d/$reg"
+    mkdir -p "$dir"
+    changed=no
+    if install_if_changed "$ca" "$dir/ca.crt"; then changed=yes; fi
+    tmp=$(mktemp)
+    printf 'server = "https://%s"\nca = "%s/ca.crt"\n' "$reg" "$dir" > "$tmp"
+    if install_if_changed "$tmp" "$dir/hosts.toml"; then changed=yes; fi
+    rm -f "$tmp"
+    if [ "$changed" = yes ]; then
+      echo "[ok]   $reg: $dir/hosts.toml"
+    else
+      echo "[ok]   $reg: already configured"
+    fi
+  done
+
+  if grep -qs "^[[:space:]]*config_path[[:space:]]*=[[:space:]]*\"$certs_d/*\"" /etc/containerd/config.toml; then
+    echo "Takes effect on the next pull - no containerd restart needed."
+  else
+    echo "[warn] These files only work if containerd's registry config_path points at $certs_d,"
+    echo "       and /etc/containerd/config.toml does not set it. Add one of these (the table"
+    echo "       depends on your containerd version) and restart containerd once:"
+    echo "         containerd 1.x: [plugins.\"io.containerd.grpc.v1.cri\".registry]"
+    echo "         containerd 2.x: [plugins.\"io.containerd.cri.v1.images\".registry]"
+    echo "           config_path = \"$certs_d\""
+  fi
+  exit 0
+fi
+
+if [ -d /usr/local/share/ca-certificates ]; then
+  dir=/usr/local/share/ca-certificates; update='update-ca-certificates'
+elif [ -d /etc/pki/ca-trust/source/anchors ]; then
+  dir=/etc/pki/ca-trust/source/anchors; update='update-ca-trust extract'
+elif [ -d /etc/pki/trust/anchors ]; then
+  dir=/etc/pki/trust/anchors; update='update-ca-certificates'
+else
+  echo "Error: no CA trust directory found on this node" >&2
+  exit 1
+fi
+
+if ! install_if_changed "$ca" "$dir/netskope-ca.crt"; then
+  echo "[ok]   Netskope CA already installed in $dir - nothing to do (containerd not restarted)"
+  exit 0
+fi
+$update
+echo "[ok]   Netskope CA installed in $dir"
+
+if command -v systemctl >/dev/null 2>&1 && systemctl restart containerd; then
+  echo "[ok]   containerd restarted"
+else
+  echo "[warn] Could not restart containerd - restart it yourself to pick up the new CA" >&2
+  echo "       (k3s and RKE2 embed containerd: restart the k3s / rke2 service instead)" >&2
+fi
+EOF
+  chmod +x "$K8S_ASSET_DIR/trust-netskope-ca-on-node.sh"
+
+  # Rebuilding later without prompts (for example after the CA rotates): copy this script next
+  # to the bundle and write a wrapper that runs it with --non-interactive.
+  local self="${BASH_SOURCE[0]}" script_name
+  if [[ -f "$self" ]]; then
+    script_name=$(basename "$self")
+    if [[ ! "$self" -ef "$certDir/$script_name" ]]; then
+      cp "$self" "$certDir/$script_name"
+      chmod +x "$certDir/$script_name"
+    fi
+    k8s_render <<'EOF' | sed "s|@@SCRIPT@@|$script_name|g" > "$K8S_ASSET_DIR/regenerate.sh"
+#!/bin/sh
+## Rebuilds the files in this directory from the existing bundle, without prompting for the
+## tenant or API token (@@SCRIPT@@ --non-interactive). That also re-applies the
+## tool configuration, which is idempotent. Extra options are passed through, e.g.
+##   ./regenerate.sh --k8s-namespace other-namespace
+set -eu
+
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+parent=$(dirname -- "$here")
+script="$parent/@@SCRIPT@@"
+[ -f "$script" ] || { echo "Error: $script not found - keep this directory next to the bundle" >&2; exit 1; }
+exec bash "$script" --k8s --non-interactive --cert-dir "$parent" --cert-name '@@BUNDLE@@' --k8s-namespace '@@NAMESPACE@@' "$@"
+EOF
+    chmod +x "$K8S_ASSET_DIR/regenerate.sh"
+  else
+    say_warn "Could not locate this script to copy next to the bundle - regenerate.sh not written"
+  fi
+}
+
+k8s_failed=false
+# Say nothing unless Kubernetes was asked for or kubectl suggests the offer, so a run without
+# --k8s on a machine without kubectl prints exactly what it always did.
+if [[ "$K8S" == true ]] || command_exists kubectl; then
+  say_section "Configuring Kubernetes"
+
+  if [[ "$K8S" != true && "$NON_INTERACTIVE" != true ]]; then
+    echo "  kubectl detected."
+    read -p "  Generate Kubernetes CA assets in $K8S_ASSET_DIR? (y/N) " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+      K8S=true
+      if [[ "$K8S_NAMESPACE_SET" != true ]]; then
+        read -r -p "  Kubernetes namespace [$K8S_NAMESPACE]: " k8s_ns_answer
+        K8S_NAMESPACE=${k8s_ns_answer:-$K8S_NAMESPACE}
+        if ! valid_k8s_namespace "$K8S_NAMESPACE"; then
+          echo "Error: invalid namespace '$K8S_NAMESPACE' (lowercase letters, digits and '-', at most 63 characters)" >&2
+          exit 2
+        fi
+      fi
+    fi
+  fi
+
+  if [[ "$K8S" == true ]]; then
+    if write_k8s_assets; then
+      say_ok "Kubernetes assets written: $K8S_ASSET_DIR (namespace: $K8S_NAMESPACE)"
+    else
+      k8s_failed=true
+    fi
+  else
+    say_skip "Kubernetes assets not generated (pass --k8s to generate them)"
+  fi
 fi
 
 say_section "Configuring applications"
@@ -888,10 +1419,12 @@ echo
 printf '%s============================================================%s\n' "$C_CYAN" "$C_RESET"
 printf '%s Configuration complete.%s\n' "$C_CYAN" "$C_RESET"
 echo "   Bundle:           $certDir/$certName"
-echo "   Replay script:    $CONFIGURED_TOOLS_FILE"
+echo "   Replay script:    $REPLAY_FILE"
 echo "   Shell config:     $SHELL_CONFIG"
 if [ -d "$DOCKER_ASSET_DIR" ]; then echo "   Docker assets:    $DOCKER_ASSET_DIR"; fi
+if [ -d "$K8S_ASSET_DIR" ]; then echo "   K8s assets:       $K8S_ASSET_DIR"; fi
 echo
 echo "   Open a new terminal, or run: source $SHELL_CONFIG"
-echo "   For silent deployment elsewhere: source $CONFIGURED_TOOLS_FILE"
+echo "   For silent deployment elsewhere: source $REPLAY_FILE"
 printf '%s============================================================%s\n' "$C_CYAN" "$C_RESET"
+if [[ "$k8s_failed" == true ]]; then exit 1; fi

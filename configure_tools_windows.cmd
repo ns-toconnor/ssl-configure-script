@@ -1,7 +1,7 @@
 @echo off
 :: Launcher for configure_tools_windows.ps1.
 :: All implementation lives in the PowerShell script next to this file.
-:: Forwards any args to the script (use -TenantName, -CertDir, -NonInteractive, etc.).
+:: Forwards any args to the script (use -TenantName, -CertDir, -NonInteractive, -K8s, etc.).
 :: enabledelayedexpansion is required: a parenthesized if/else block has all of its
 :: %VAR% references expanded at parse time, so a plain %ERRORLEVEL% inside the block
 :: would read a stale value from before `where` ran. !ERRORLEVEL! defers the read.
